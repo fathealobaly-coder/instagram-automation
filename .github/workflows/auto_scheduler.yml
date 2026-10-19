@@ -1,83 +1,41 @@
-
-name: Auto Video Trend Scheduler
+name: Instagram Reels Automation Core Pipeline 2026
 
 on:
   push:
     branches:
       - main
-
   schedule:
-    - cron: '17 */8 * * *'
-
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: auto-video-trend-scheduler-${{ github.ref }}
-  cancel-in-progress: false
+    - cron: '0 12 * * *'
 
 jobs:
-  run-trend-agent:
-    name: Run trend agent
+  run_agents:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    env:
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      PYTHONUNBUFFERED: '1'
-
     steps:
-      - name: Check out repository
+      - name: Checkout Code Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Initialize Python Runtime 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
-      - name: Check agent and install dependencies
-        shell: bash
+      - name: Install Verified Dependencies
         run: |
-          set -e
-
-          if [ ! -f "trend_agent.py" ]; then
-            echo "ERROR: trend_agent.py is missing from repository root."
-            exit 1
-          fi
-
           python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-          if [ -f "requirements.txt" ]; then
-            echo "Found requirements.txt. Installing dependencies."
-            python -m pip install -r requirements.txt
-          else
-            echo "WARNING: requirements.txt is missing."
-            echo "Installing requests as the fallback dependency."
-            python -m pip install "requests>=2.32.0,<3.0.0"
-          fi
-
-          python -m py_compile trend_agent.py
-          echo "Pre-flight checks passed."
-
-      - name: Validate required secrets
-        shell: bash
+      - name: Execute Autonomous Video Crawler (Trend Agent)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          set -e
+          python trend_agent.py
 
-          test -n "$SUPABASE_URL" || {
-            echo "ERROR: Missing SUPABASE_URL secret."
-            exit 1
-          }
-
-          test -n "$SUPABASE_SERVICE_ROLE_KEY" || {
-            echo "ERROR: Missing SUPABASE_SERVICE_ROLE_KEY secret."
-            exit 1
-          }
-
-          echo "Required secrets are present."
-
-      - name: Run trend agent
-        run: python trend_agent.py
+      - name: Execute Live Instagram Reels Broadcast (Instagram Agent)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          INSTAGRAM_ACCOUNT_ID: ${{ secrets.INSTAGRAM_ACCOUNT_ID }}
+          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+        run: |
+          python instagram_agent.py
