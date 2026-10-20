@@ -1,4 +1,4 @@
-supabase==2.10.0
-postgrest==0.16.5
-requests==2.32.3
-urllib3==2.2.3
+supabase
+requests
+urllib3
+postgrest
