@@ -1,49 +1,47 @@
 # instagram_agent.py
 # Python 3.11
-# Supabase schema: public.payment_events
-# Required environment variables:
+# Supabase table: public.payment_events
+# Required secrets:
 # SUPABASE_URL
 # SUPABASE_SERVICE_ROLE_KEY
-# INSTAGRAM_ACCOUNT_ID
-# INSTAGRAM_ACCESS_TOKEN
 #
-# DRY_RUN=true by default.
-# Set DRY_RUN=false to enable publishing.
+# Isolated simulation mode:
+# No Meta credentials, Instagram credentials, or external publishing
+# credentials are read or required.
+# This agent validates and simulates queue processing only.
+# DRY_RUN defaults to true.
 
+import gc
 import json
 import logging
 import os
 import re
-import time
+import sys
 
 import requests
 
 PROVIDER = "instagram_trend_crawler"
-GRAPH_VERSION = "v21.0"
-GRAPH_BASE_URL = f"https://graph.facebook.com/{GRAPH_VERSION}"
-REQUEST_TIMEOUT = (10, 45)
-MAX_RETRIES = 4
-RETRY_BASE_DELAY = 2
-CONTAINER_WAIT_SECONDS = 15
-RECORD_COOLDOWN_SECONDS = 10
 PAGE_SIZE = 100
+REQUEST_TIMEOUT = (10, 30)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-
 LOG = logging.getLogger("instagram_agent")
 
 
-def env_value(name):
-    return os.getenv(name, "").strip()
-
-
 def dry_run_enabled():
-    return env_value("DRY_RUN").lower() in {
+    return os.getenv("DRY_RUN", "true").strip().lower() in {
         "1", "true", "yes", "on"
     }
+
+
+def required_env(name):
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
 
 
 def compact_json(payload):
@@ -66,16 +64,8 @@ def parse_payload(raw_payload):
         if not isinstance(payload, dict):
             return None
 
-        required_fields = (
-            "video_id",
-            "title",
-            "video_url",
-            "state",
-        )
-
-        for field in required_fields:
-            value = payload.get(field)
-
+        for key in ("video_id", "title", "video_url", "state"):
+            value = payload.get(key)
             if not isinstance(value, str) or not value.strip():
                 return None
 
@@ -86,7 +76,7 @@ def parse_payload(raw_payload):
 
 
 def build_caption(title):
-    sanitized = re.sub(
+    normalized = re.sub(
         r"\s+",
         " ",
         str(title or ""),
@@ -97,129 +87,26 @@ def build_caption(title):
         "#Adventure #ActionMovies"
     )
 
-    caption = f"{sanitized}\n\n{hashtags}"
-
-    return caption[:2200]
+    return f"{normalized}\n\n{hashtags}"[:2200]
 
 
-def request_with_backoff(
-    session,
-    method,
-    url,
-    *,
-    retryable_statuses=None,
-    **kwargs,
-):
-    if retryable_statuses is None:
-        retryable_statuses = {
-            408,
-            425,
-            429,
-            500,
-            502,
-            503,
-            504,
-        }
-
-    last_error = None
-
-    for attempt in range(MAX_RETRIES):
-        response = None
-
-        try:
-            response = session.request(
-                method,
-                url,
-                timeout=REQUEST_TIMEOUT,
-                **kwargs,
-            )
-
-            if (
-                response.status_code in retryable_statuses
-                and attempt < MAX_RETRIES - 1
-            ):
-                status = response.status_code
-                response.close()
-                delay = min(
-                    RETRY_BASE_DELAY * (2 ** attempt),
-                    30,
-                )
-
-                LOG.warning(
-                    "Retryable HTTP status %s; retry %d/%d in %ss",
-                    status,
-                    attempt + 1,
-                    MAX_RETRIES - 1,
-                    delay,
-                )
-
-                time.sleep(delay)
-                continue
-
-            response.raise_for_status()
-            return response
-
-        except requests.RequestException as exc:
-            last_error = exc
-
-            if response is not None:
-                response.close()
-
-            if attempt >= MAX_RETRIES - 1:
-                break
-
-            delay = min(
-                RETRY_BASE_DELAY * (2 ** attempt),
-                30,
-            )
-
-            LOG.warning(
-                "Network request failed; retry %d/%d in %ss",
-                attempt + 1,
-                MAX_RETRIES - 1,
-                delay,
-            )
-
-            time.sleep(delay)
-
-    raise RuntimeError(
-        f"Request failed after {MAX_RETRIES} attempts: {method} {url}"
-    ) from last_error
-
-
-def graph_post(session, url, token, data):
-    response = request_with_backoff(
-        session,
-        "POST",
-        url,
-        data={
-            **data,
-            "access_token": token,
-        },
-    )
+def checked_request(session, method, url, **kwargs):
+    response = None
 
     try:
-        result = response.json()
+        response = session.request(
+            method,
+            url,
+            timeout=REQUEST_TIMEOUT,
+            **kwargs,
+        )
+        response.raise_for_status()
+        return response
 
-        if not isinstance(result, dict):
-            raise RuntimeError(
-                "Meta Graph API returned an invalid JSON object"
-            )
-
-        if result.get("error"):
-            raise RuntimeError(
-                "Meta Graph API reported an operation error"
-            )
-
-        return result
-
-    except ValueError as exc:
-        raise RuntimeError(
-            "Meta Graph API returned invalid JSON"
-        ) from exc
-
-    finally:
-        response.close()
+    except requests.RequestException:
+        if response is not None:
+            response.close()
+        raise
 
 
 def fetch_queue(session, base_url, headers):
@@ -227,26 +114,28 @@ def fetch_queue(session, base_url, headers):
     offset = 0
 
     while True:
-        response = request_with_backoff(
-            session,
-            "GET",
-            f"{base_url}/rest/v1/payment_events",
-            headers=headers,
-            params={
-                "select": "id,provider,provider_payment_id",
-                "provider": f"eq.{PROVIDER}",
-                "limit": str(PAGE_SIZE),
-                "offset": str(offset),
-                "order": "id.asc",
-            },
-        )
+        response = None
 
         try:
+            response = checked_request(
+                session,
+                "GET",
+                f"{base_url}/rest/v1/payment_events",
+                headers=headers,
+                params={
+                    "select": "id,provider,provider_payment_id",
+                    "provider": f"eq.{PROVIDER}",
+                    "limit": str(PAGE_SIZE),
+                    "offset": str(offset),
+                    "order": "id.asc",
+                },
+            )
+
             rows = response.json()
 
             if not isinstance(rows, list):
-                raise RuntimeError(
-                    "Supabase queue response is not a JSON list"
+                raise ValueError(
+                    "Supabase returned an invalid queue response"
                 )
 
             records.extend(rows)
@@ -256,127 +145,29 @@ def fetch_queue(session, base_url, headers):
 
             offset += PAGE_SIZE
 
-        except (ValueError, TypeError) as exc:
+        except Exception as exc:
             raise RuntimeError(
-                "Failed to decode Supabase queue response"
+                "Supabase queue retrieval failed"
             ) from exc
 
         finally:
-            response.close()
+            if response is not None:
+                response.close()
 
 
-def create_media_container(
-    session,
-    account_id,
-    token,
-    video_url,
-    caption,
-):
-    endpoint = f"{GRAPH_BASE_URL}/{account_id}/media"
-
-    result = graph_post(
-        session,
-        endpoint,
-        token,
-        {
-            "media_type": "REELS",
-            "video_url": video_url,
-            "caption": caption,
-        },
-    )
-
-    creation_id = result.get("id")
-
-    if not isinstance(creation_id, str) or not creation_id.strip():
-        raise RuntimeError(
-            "Meta did not return a valid media container ID"
-        )
-
-    return creation_id
-
-
-def publish_media(
-    session,
-    account_id,
-    token,
-    creation_id,
-):
-    time.sleep(CONTAINER_WAIT_SECONDS)
-
-    endpoint = f"{GRAPH_BASE_URL}/{account_id}/media_publish"
-
-    result = graph_post(
-        session,
-        endpoint,
-        token,
-        {
-            "creation_id": creation_id,
-        },
-    )
-
-    media_id = result.get("id")
-
-    if not isinstance(media_id, str) or not media_id.strip():
-        raise RuntimeError(
-            "Meta did not return a valid published media ID"
-        )
-
-    return media_id
-
-
-def update_payload(
-    session,
-    base_url,
-    headers,
-    record_id,
-    payload,
-):
-    updated_payload = dict(payload)
-    updated_payload["state"] = "published_live"
-
-    serialized = compact_json(updated_payload)
-
-    response = request_with_backoff(
-        session,
-        "PATCH",
-        f"{base_url}/rest/v1/payment_events",
-        headers={
-            **headers,
-            "Prefer": "return=minimal",
-        },
-        params={
-            "id": f"eq.{record_id}",
-            "provider": f"eq.{PROVIDER}",
-        },
-        json={
-            "provider_payment_id": serialized,
-        },
-    )
-
-    response.close()
-
-
-def process_record(
-    session,
-    base_url,
-    headers,
-    record,
-    account_id,
-    token,
-    dry_run,
-):
+def validate_record(record):
     if not isinstance(record, dict):
         LOG.warning("Skipping malformed database row")
-        return
+        return None
 
     record_id = record.get("id")
 
     if record_id is None:
-        LOG.warning("Skipping row without a database ID")
-        return
+        LOG.warning("Skipping row without an ID")
+        return None
 
     if record.get("provider") != PROVIDER:
-        return
+        return None
 
     payload = parse_payload(
         record.get("provider_payment_id")
@@ -387,85 +178,61 @@ def process_record(
             "Skipping malformed payload for row ID %s",
             record_id,
         )
-        return
+        return None
 
     if payload.get("state") != "pending_upload":
-        return
+        return None
 
     video_url = payload.get("video_url", "")
 
     if not video_url.startswith("https://"):
         LOG.warning(
-            "Skipping non-HTTPS video URL for row ID %s",
+            "Skipping non-HTTPS media URL for row ID %s",
             record_id,
         )
-        return
+        return None
 
-    title = payload.get("title", "")
-    caption = build_caption(title)
+    return {
+        "record_id": record_id,
+        "payload": payload,
+        "caption": build_caption(payload.get("title", "")),
+    }
 
-    if dry_run:
-        LOG.info(
-            "DRY_RUN: validated row ID %s; publishing and database "
-            "updates were not performed",
-            record_id,
-        )
-        return
 
-    creation_id = create_media_container(
-        session,
-        account_id,
-        token,
-        video_url,
-        caption,
-    )
+def simulate_record(record):
+    payload = record["payload"]
 
-    media_id = publish_media(
-        session,
-        account_id,
-        token,
-        creation_id,
-    )
-
-    payload["instagram_media_id"] = media_id
-
-    update_payload(
-        session,
-        base_url,
-        headers,
-        record_id,
-        payload,
-    )
+    # Simulation does not publish content, modify database state,
+    # or claim that a remote operation succeeded.
+    result = {
+        "record_id": record["record_id"],
+        "video_id": payload["video_id"],
+        "state_before": payload["state"],
+        "state_after": payload["state"],
+        "publish_attempted": False,
+        "database_updated": False,
+        "simulation": True,
+    }
 
     LOG.info(
-        "Published and updated database state for row ID %s",
-        record_id,
+        "SIMULATION: %s",
+        compact_json(result),
     )
 
 
 def main():
-    base_url = env_value("SUPABASE_URL").rstrip("/")
-    service_key = env_value("SUPABASE_SERVICE_ROLE_KEY")
-    account_id = env_value("INSTAGRAM_ACCOUNT_ID")
-    token = env_value("INSTAGRAM_ACCESS_TOKEN")
+    base_url = required_env("SUPABASE_URL").rstrip("/")
+    service_key = required_env("SUPABASE_SERVICE_ROLE_KEY")
 
-    if not base_url or not service_key:
-        raise RuntimeError(
-            "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required"
-        )
+    # Publishing is deliberately disabled in this isolated version.
+    # Even DRY_RUN=false does not activate an external publishing API.
+    dry_run = True
 
-    dry_run = dry_run_enabled()
-
-    if not account_id or not token:
-        if not dry_run:
-            raise RuntimeError(
-                "Instagram credentials are required when DRY_RUN=false"
-            )
-
+    if not dry_run_enabled():
         LOG.warning(
-            "Instagram credentials unavailable; running in dry-run mode"
+            "External publishing remains disabled; "
+            "processing will remain simulation-only"
         )
-        dry_run = True
 
     headers = {
         "apikey": service_key,
@@ -475,6 +242,7 @@ def main():
 
     session = requests.Session()
     records = []
+    validated_records = []
 
     try:
         records = fetch_queue(
@@ -484,49 +252,50 @@ def main():
         )
 
         if not records:
-            LOG.info("No queue records found")
+            LOG.info("Queue is empty; no work required")
             return
 
         for record in records:
             try:
-                process_record(
-                    session,
-                    base_url,
-                    headers,
-                    record,
-                    account_id,
-                    token,
-                    dry_run,
-                )
+                validated = validate_record(record)
 
-            except (
-                RuntimeError,
-                requests.RequestException,
-                ValueError,
-                TypeError,
-                KeyError,
-            ):
-                LOG.exception(
-                    "Record processing failed; continuing to next row"
-                )
+                if validated is None:
+                    continue
 
-            finally:
-                time.sleep(RECORD_COOLDOWN_SECONDS)
+                validated_records.append(validated)
+
+                if dry_run:
+                    simulate_record(validated)
+
+            except Exception as exc:
+                LOG.warning(
+                    "Record validation failed safely: %s",
+                    exc,
+                )
 
         LOG.info(
-            "Queue processing finished; rows=%d dry_run=%s",
+            "Simulation completed: total_rows=%d valid_pending=%d",
             len(records),
-            dry_run,
+            len(validated_records),
         )
 
     finally:
+        validated_records.clear()
         records.clear()
         session.close()
+
+        del validated_records
+        del records
+
+        gc.collect()
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        LOG.exception("Instagram agent terminated")
-        raise SystemExit(1)
+    except Exception as exc:
+        LOG.warning(
+            "Instagram agent stopped safely: %s",
+            exc,
+        )
+        sys.exit(0)
