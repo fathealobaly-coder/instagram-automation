@@ -1,66 +1,220 @@
 import os
 import sys
-import gc
-import urllib.parse
+from datetime import datetime, timezone
+from urllib.parse import quote
+
 import requests
 
-from supabase import create_client, Client
-
-# حاجز الأمان: يمنع الكتابة إلى قاعدة البيانات أثناء الاختبارات.
+# حاجز الأمان: لا كتابة فعلية أثناء الاختبارات.
 DRY_RUN = True
 
-ARCHIVE_SEARCH_URL = "https://archive.org/advancedsearch.php"
-ARCHIVE_METADATA_URL = "https://archive.org/metadata/{}"
-ARCHIVE_DOWNLOAD_URL = "https://archive.org/download/{}/{}"
-
-MAX_VIDEOS_PER_RUN = 3
+MAX_VIDEOS_PER_DAY = 3
 REQUEST_TIMEOUT = 15
-PROVIDER_NAME = "archive_real_action_v13"
+
+SEARCH_URL = "https://archive.org/advancedsearch.php"
+METADATA_URL = "https://archive.org/metadata/{}"
+DOWNLOAD_URL = "https://archive.org/download/{}/{}"
+
+ACTION_TERMS = (
+    "action",
+    "stunt",
+    "chase",
+    "martial arts",
+    "fight",
+    "adventure",
+    "thriller",
+    "car chase",
+    "kung fu",
+    "boxing",
+)
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "AutonomousTrendIngestionAgent/13.0"
+    "User-Agent": "AutonomousTrendIngestionAgent/14.0"
 })
 
 
-def get_verified_mp4_url(identifier: str):
-    """
-    العثور على ملف MP4 في Internet Archive والتحقق من استجابة الرابط.
-    التحقق هنا لا يضمن سلامة الفيديو بالكامل أو حقوق إعادة نشره.
-    """
-    if not isinstance(identifier, str) or not identifier.strip():
-        print("[REJECT] معرف فارغ أو غير صالح.")
+def required_env(name):
+    value = os.getenv(name, "").strip()
+
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable: {name}"
+        )
+
+    if name == "SUPABASE_URL":
+        return value.rstrip("/")
+
+    return value
+
+
+def supabase_headers(key, prefer=None):
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Accept": "application/json",
+    }
+
+    if prefer:
+        headers["Prefer"] = prefer
+
+    return headers
+
+
+def is_action_title(title):
+    normalized = str(title or "").lower()
+
+    return any(
+        term in normalized
+        for term in ACTION_TERMS
+    )
+
+
+def verify_mp4_url(identifier, filename):
+    safe_id = quote(identifier, safe="")
+    safe_name = quote(filename, safe="")
+
+    url = DOWNLOAD_URL.format(
+        safe_id,
+        safe_name
+    )
+
+    try:
+        with SESSION.get(
+            url,
+            headers={"Range": "bytes=0-63"},
+            timeout=REQUEST_TIMEOUT,
+            stream=True,
+            allow_redirects=True,
+        ) as response:
+
+            if response.status_code not in (200, 206):
+                return None
+
+            content_type = response.headers.get(
+                "Content-Type", ""
+            ).lower()
+
+            if not (
+                content_type.startswith("video/")
+                or content_type == "application/octet-stream"
+            ):
+                return None
+
+            first_bytes = next(
+                response.iter_content(chunk_size=64),
+                b""
+            )
+
+            # فحص أولي لعلامة MP4.
+            if b"ftyp" not in first_bytes[:32]:
+                return None
+
+            return url
+
+    except requests.RequestException as exc:
+        print(
+            f"[URL_REJECT] {identifier}/{filename}: {exc}"
+        )
         return None
 
-    identifier = identifier.strip()
-    safe_identifier = urllib.parse.quote(identifier, safe="")
 
-    metadata_url = ARCHIVE_METADATA_URL.format(safe_identifier)
+def discover_videos():
+    query = (
+        'mediatype:movies AND '
+        '(subject:action OR subject:thriller OR '
+        'subject:stunts OR subject:chase OR '
+        'subject:"martial arts") AND language:eng'
+    )
 
     try:
         response = SESSION.get(
-            metadata_url,
-            timeout=REQUEST_TIMEOUT
+            SEARCH_URL,
+            params={
+                "q": query,
+                "fl[]": ["identifier", "title"],
+                "rows": 50,
+                "output": "json",
+                "page": 1,
+            },
+            timeout=REQUEST_TIMEOUT,
         )
 
-        if response.status_code != 200:
-            print(
-                f"[REJECT] Metadata HTTP {response.status_code}: "
-                f"{identifier}"
+        response.raise_for_status()
+        data = response.json()
+
+        docs = data.get(
+            "response", {}
+        ).get("docs", [])
+
+        if not isinstance(docs, list):
+            raise ValueError(
+                "Unexpected Internet Archive search format"
             )
-            return None
+
+    except (
+        requests.RequestException,
+        ValueError,
+        TypeError,
+    ) as exc:
+        print(f"[SEARCH_ERROR] {exc}")
+        return []
+
+    found = []
+    seen_ids = set()
+
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+
+        identifier = doc.get("identifier")
+        title = str(
+            doc.get("title") or "Untitled"
+        ).strip()
+
+        if (
+            not isinstance(identifier, str)
+            or not identifier.strip()
+        ):
+            continue
+
+        identifier = identifier.strip()
+
+        if identifier in seen_ids:
+            continue
+
+        # فلترة أولية بالعنوان، وليست ضمانًا لمحتوى الفيديو.
+        if not is_action_title(title):
+            continue
+
+        seen_ids.add(identifier)
 
         try:
-            metadata = response.json()
-        except ValueError:
-            print(f"[REJECT] Metadata ليست JSON صالحًا: {identifier}")
-            return None
+            metadata_response = SESSION.get(
+                METADATA_URL.format(
+                    quote(identifier, safe="")
+                ),
+                timeout=REQUEST_TIMEOUT,
+            )
 
-        files = metadata.get("files", [])
+            metadata_response.raise_for_status()
+
+            files = metadata_response.json().get(
+                "files", []
+            )
+
+        except (
+            requests.RequestException,
+            ValueError,
+            TypeError,
+        ) as exc:
+            print(
+                f"[METADATA_REJECT] {identifier}: {exc}"
+            )
+            continue
 
         if not isinstance(files, list):
-            print(f"[REJECT] بنية قائمة الملفات غير صالحة: {identifier}")
-            return None
+            continue
 
         candidates = []
 
@@ -70,304 +224,196 @@ def get_verified_mp4_url(identifier: str):
 
             filename = item.get("name")
 
-            if not isinstance(filename, str):
+            if (
+                not isinstance(filename, str)
+                or not filename.lower().endswith(".mp4")
+            ):
                 continue
-
-            # قبول الملفات ذات امتداد MP4 فقط.
-            if not filename.lower().endswith(".mp4"):
-                continue
-
-            # استبعاد الملفات التي لا تحتوي على حجم صالح.
-            size = item.get("size")
 
             try:
-                if size is None or int(size) <= 0:
+                size = int(item.get("size", 0))
+
+                if size <= 0:
                     continue
+
             except (ValueError, TypeError):
                 continue
 
-            format_type = str(item.get("format", "")).lower()
+            candidates.append(filename)
 
-            # تفضيل ملفات الفيديو التي تشير بياناتها إلى MP4 أو H.264.
-            score = 1
-
-            if "mp4" in format_type:
-                score += 3
-            elif "h.264" in format_type:
-                score += 2
-            elif "mpeg4" in format_type:
-                score += 2
-
-            candidates.append((score, filename))
-
-        if not candidates:
-            print(f"[REJECT] لم يُعثر على ملف MP4 مناسب: {identifier}")
-            return None
-
-        candidates.sort(key=lambda candidate: candidate[0], reverse=True)
-
-        for _, filename in candidates:
-            safe_filename = urllib.parse.quote(filename, safe="")
-
-            video_url = ARCHIVE_DOWNLOAD_URL.format(
-                safe_identifier,
-                safe_filename
+        for filename in candidates:
+            verified_url = verify_mp4_url(
+                identifier,
+                filename
             )
 
-            if _check_video_response(video_url, identifier):
-                return video_url
-
-        print(f"[REJECT] لم ينجح فحص أي رابط فيديو: {identifier}")
-        return None
-
-    except requests.RequestException as error:
-        print(f"[NETWORK_ERROR] فشل طلب metadata: {error}")
-        return None
-
-    except (TypeError, KeyError) as error:
-        print(f"[DATA_ERROR] بيانات غير متوقعة للمعرف {identifier}: {error}")
-        return None
-
-
-def _check_video_response(video_url: str, identifier: str) -> bool:
-    """
-    فحص ترويسات HEAD، ثم تجربة GET بنطاق جزئي عند الحاجة.
-    لا ينزّل الفيديو كاملًا ولا يثبت قابليته للتشغيل الكامل.
-    """
-
-    try:
-        with SESSION.head(
-            video_url,
-            timeout=8,
-            allow_redirects=True
-        ) as response:
-
-            content_type = response.headers.get(
-                "Content-Type", ""
-            ).lower()
-
-            if (
-                response.status_code == 200
-                and (
-                    content_type.startswith("video/")
-                    or content_type == "application/octet-stream"
-                )
-            ):
-                print(f"[HTTP_CHECK_OK] {identifier}")
-                return True
-
-    except requests.RequestException as error:
-        print(f"[HEAD_WARNING] {identifier}: {error}")
-
-    try:
-        with SESSION.get(
-            video_url,
-            headers={"Range": "bytes=0-1023"},
-            timeout=8,
-            stream=True
-        ) as response:
-
-            content_type = response.headers.get(
-                "Content-Type", ""
-            ).lower()
-
-            accepted_type = (
-                content_type.startswith("video/")
-                or content_type == "application/octet-stream"
-            )
-
-            if response.status_code == 206 and accepted_type:
-                print(f"[RANGE_CHECK_OK] {identifier}")
-                return True
-
-            # بعض الخوادم تتجاهل Range وتعيد الملف كاملًا برمز 200.
-            if response.status_code == 200 and accepted_type:
-                print(f"[GET_CHECK_OK] {identifier}")
-                return True
-
-            print(
-                f"[HTTP_REJECT] {identifier}: "
-                f"status={response.status_code}, "
-                f"type={content_type}"
-            )
-
-    except requests.RequestException as error:
-        print(f"[GET_WARNING] {identifier}: {error}")
-
-    return False
-
-
-def fetch_real_action_videos() -> list:
-    """
-    البحث عن مقاطع أجنبية مصنفة ضمن الأكشن والإثارة والمطاردات.
-    الكلمات المفتاحية لا تضمن أن كل نتيجة مناسبة فعليًا.
-    """
-    query = (
-        "mediatype:movies AND "
-        "(subject:action OR subject:thriller OR "
-        "subject:stunts OR subject:chase) AND "
-        "language:eng"
-    )
-
-    params = {
-        "q": query,
-        "fl[]": ["identifier", "title"],
-        "rows": 30,
-        "output": "json",
-        "page": 1,
-    }
-
-    valid_videos = []
-    seen_identifiers = set()
-
-    try:
-        print("[FETCH] البحث في Internet Archive...")
-
-        response = SESSION.get(
-            ARCHIVE_SEARCH_URL,
-            params=params,
-            timeout=REQUEST_TIMEOUT
-        )
-
-        if response.status_code != 200:
-            print(f"[FETCH_ERROR] HTTP {response.status_code}")
-            return []
-
-        try:
-            search_data = response.json()
-        except ValueError:
-            print("[FETCH_ERROR] استجابة البحث ليست JSON صالحًا.")
-            return []
-
-        docs = search_data.get("response", {}).get("docs", [])
-
-        if not isinstance(docs, list):
-            print("[FETCH_ERROR] بنية نتائج البحث غير صالحة.")
-            return []
-
-        for document in docs:
-            if not isinstance(document, dict):
-                continue
-
-            identifier = document.get("identifier")
-
-            if not isinstance(identifier, str) or not identifier.strip():
-                continue
-
-            if identifier in seen_identifiers:
-                continue
-
-            seen_identifiers.add(identifier)
-
-            verified_url = get_verified_mp4_url(identifier)
-
-            if not verified_url:
-                continue
-
-            valid_videos.append({
-                "id": identifier,
-                "title": document.get("title", "Untitled"),
-                "url": verified_url,
-            })
-
-            if len(valid_videos) >= MAX_VIDEOS_PER_RUN:
+            if verified_url:
+                found.append({
+                    "video_url": verified_url,
+                    "caption": title,
+                })
                 break
 
-        print(
-            f"[FETCH_SUMMARY] عدد الروابط المقبولة: "
-            f"{len(valid_videos)}"
+        if len(found) >= MAX_VIDEOS_PER_DAY:
+            break
+
+    print(f"[DISCOVERY] Candidates found: {len(found)}")
+
+    return found
+
+
+def get_today_rows(base_url, key):
+    today_utc = (
+        datetime.now(timezone.utc)
+        .date()
+        .isoformat()
+        + "T00:00:00+00:00"
+    )
+
+    response = SESSION.get(
+        f"{base_url}/rest/v1/generated_videos",
+        headers=supabase_headers(key),
+        params={
+            "select": "video_url,created_at",
+            "created_at": f"gte.{today_utc}",
+            "order": "created_at.desc",
+            "limit": "1000",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+    rows = response.json()
+
+    if not isinstance(rows, list):
+        raise ValueError(
+            "Invalid generated_videos response"
         )
 
-        return valid_videos
-
-    except requests.RequestException as error:
-        print(f"[FETCH_NETWORK_ERROR] {error}")
-        return []
+    return rows
 
 
-def run_secure_agent():
-    """
-    اكتشاف الفيديوهات وفحص وجود المعرّف في payment_events.
-    وضع DRY_RUN يمنع الإدخال والتعديل.
-    """
+def video_exists(base_url, key, video_url):
+    response = SESSION.get(
+        f"{base_url}/rest/v1/generated_videos",
+        headers=supabase_headers(key),
+        params={
+            "select": "id",
+            "video_url": f"eq.{video_url}",
+            "limit": "1",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
 
-    discovered_videos = []
+    response.raise_for_status()
+    rows = response.json()
+
+    if not isinstance(rows, list):
+        raise ValueError(
+            "Invalid duplicate-check response"
+        )
+
+    return bool(rows)
+
+
+def insert_video(base_url, key, video):
+    # لا يُستدعى هذا الإجراء أثناء DRY_RUN.
+    response = SESSION.post(
+        f"{base_url}/rest/v1/generated_videos",
+        headers=supabase_headers(
+            key,
+            "return=representation"
+        ),
+        json={
+            "video_url": video["video_url"],
+            "caption": video["caption"][:2200],
+            "status": "ready_to_publish",
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+def main():
+    base_url = required_env("SUPABASE_URL")
+    key = required_env("SUPABASE_SERVICE_ROLE_KEY")
 
     print(
-        f"[AGENT_START] Trend Agent V13 | "
-        f"DRY_RUN={DRY_RUN}"
+        f"[START] Trend Agent V14 | DRY_RUN={DRY_RUN}"
     )
 
     try:
-        supabase_url = os.environ.get("SUPABASE_URL")
-        supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-
-        if not supabase_url or not supabase_key:
-            print(
-                "[CRITICAL] متغيرات Supabase المطلوبة غير موجودة."
-            )
-            return 1
-
-        discovered_videos = fetch_real_action_videos()
-
-        if not discovered_videos:
-            print("[INFO] لم يُعثر على فيديوهات مقبولة في هذه الدورة.")
-            return 1
-
-        # اختيار الفيديو الأول فقط للفحص.
-        target_video = discovered_videos[0]
-
-        print(f"[TARGET] {target_video['title']}")
-        print(f"[TARGET_URL] {target_video['url']}")
-
-        # عميل Supabase للقراءة فقط في المسار الحالي.
-        supabase_client: Client = create_client(
-            supabase_url,
-            supabase_key
+        today_rows = get_today_rows(
+            base_url,
+            key
         )
+
+        daily_count = len(today_rows)
 
         print(
-            f"[DB_CHECK] فحص المعرّف: "
-            f"{target_video['id']}"
+            f"[DAILY_COUNT] rows_today={daily_count}"
         )
 
-        result = (
-            supabase_client
-            .table("payment_events")
-            .select("id")
-            .eq("provider_payment_id", target_video["id"])
-            .limit(1)
-            .execute()
-        )
-
-        is_duplicate = bool(result.data)
-
-        if is_duplicate:
-            print("[DB_RESULT] المعرّف موجود مسبقًا.")
-        else:
-            print("[DB_RESULT] لم يُعثر على المعرّف في نتيجة الفحص.")
-
-        # حاجز الكتابة: يجب ألا يحدث أي INSERT أو UPDATE أو DELETE هنا.
-        if DRY_RUN:
-            print("[DRY_RUN] الاختبار انتهى دون كتابة إلى قاعدة البيانات.")
+        if daily_count >= MAX_VIDEOS_PER_DAY:
+            print(
+                "[LIMIT] Three videos already recorded today."
+            )
             return 0
 
-        # مسار كتابة معطل عمدًا في هذه النسخة.
-        # لا تُفعّل الكتابة قبل تصميم تخزين البيانات واختبارها.
+        candidates = discover_videos()
+
+        if not candidates:
+            print(
+                "[INFO] No qualifying candidates found."
+            )
+            return 0
+
+        processed = 0
+
+        for video in candidates:
+            if daily_count + processed >= MAX_VIDEOS_PER_DAY:
+                break
+
+            url = video["video_url"]
+
+            if video_exists(base_url, key, url):
+                print("[DUPLICATE] Skipping existing URL.")
+                continue
+
+            if DRY_RUN:
+                print(
+                    "[DRY_RUN_PREVIEW] Would insert:",
+                    url
+                )
+                processed += 1
+                continue
+
+            insert_video(base_url, key, video)
+
+            print("[INSERTED]", url)
+            processed += 1
+
         print(
-            "[BLOCKED] الكتابة الحقيقية غير مفعّلة في هذه النسخة."
+            f"[SUMMARY] processed={processed}; "
+            f"database_writes={0 if DRY_RUN else processed}"
         )
-        return 2
 
-    except Exception as error:
-        print(f"[RUNTIME_ERROR] {type(error).__name__}: {error}")
+        return 0
+
+    except (
+        requests.RequestException,
+        RuntimeError,
+        ValueError,
+        KeyError,
+    ) as exc:
+        print(
+            f"[ERROR] {type(exc).__name__}: {exc}"
+        )
         return 1
-
-    finally:
-        discovered_videos.clear()
-        gc.collect()
-        print("[CLEANUP] اكتملت عملية التنظيف.")
 
 
 if __name__ == "__main__":
-    sys.exit(run_secure_agent())
+    sys.exit(main())
