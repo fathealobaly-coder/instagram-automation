@@ -5,12 +5,13 @@ from urllib.parse import quote
 
 import requests
 
-# وضع آمن: لا كتابة فعلية إلى قاعدة البيانات.
+# حاجز أمان: لا كتابة فعلية إلى قاعدة البيانات.
 DRY_RUN = True
 
 MAX_VIDEOS_PER_DAY = 3
 REQUEST_TIMEOUT = 15
 MAX_SEARCH_RESULTS = 50
+MAX_DB_ROWS = 1000
 
 SEARCH_URL = "https://archive.org/advancedsearch.php"
 METADATA_URL = "https://archive.org/metadata/{}"
@@ -31,7 +32,7 @@ ACTION_TERMS = (
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "AutonomousTrendIngestionAgent/15.1"
+    "User-Agent": "AutonomousTrendIngestionAgent/16.0",
 })
 
 
@@ -43,7 +44,10 @@ def required_env(name):
             f"Missing required environment variable: {name}"
         )
 
-    return value.rstrip("/") if name == "SUPABASE_URL" else value
+    if name == "SUPABASE_URL":
+        return value.rstrip("/")
+
+    return value
 
 
 def supabase_headers(key, prefer=None):
@@ -66,77 +70,83 @@ def is_action_title(title):
 
 def verify_mp4_url(identifier, filename):
     """
-    فحص أولي لملف MP4:
-    - لا يقبل صفحات HTML.
-    - يتحقق من نوع المحتوى.
-    - يفحص علامة ftyp في ترويسة MP4.
+    فحص أولي لرابط تنزيل MP4.
+    لا يعتبر كود HTTP 200 وحده دليلًا على صلاحية الفيديو.
     """
-    if not identifier or not filename:
+    if not isinstance(identifier, str) or not identifier.strip():
         return None
 
-    url = DOWNLOAD_URL.format(
-        quote(identifier, safe=""),
-        quote(filename, safe="")
+    if not isinstance(filename, str) or not filename.strip():
+        return None
+
+    if not filename.lower().endswith(".mp4"):
+        return None
+
+    target_url = DOWNLOAD_URL.format(
+        quote(identifier.strip(), safe=""),
+        quote(filename.strip(), safe=""),
     )
 
     try:
         with SESSION.get(
-            url,
-            headers={"Range": "bytes=0-1023"},
+            target_url,
+            headers={"Range": "bytes=0-63"},
             timeout=REQUEST_TIMEOUT,
             stream=True,
-            allow_redirects=True
+            allow_redirects=True,
         ) as response:
 
             if response.status_code not in (200, 206):
                 print(
-                    f"[URL_REJECT] HTTP {response.status_code}: {url}"
+                    f"[URL_REJECT] HTTP {response.status_code}: "
+                    f"{target_url}"
                 )
                 return None
 
-            content_type = response.headers.get(
-                "Content-Type", ""
-            ).split(";")[0].strip().lower()
+            content_type = (
+                response.headers.get("Content-Type", "")
+                .split(";")[0]
+                .strip()
+                .lower()
+            )
 
             if content_type not in (
                 "video/mp4",
-                "application/octet-stream"
+                "application/octet-stream",
             ):
                 print(
-                    f"[URL_REJECT] Invalid content type "
-                    f"{content_type}: {url}"
+                    f"[URL_REJECT] Content-Type={content_type}: "
+                    f"{target_url}"
                 )
                 return None
 
             first_bytes = next(
                 response.iter_content(chunk_size=32),
-                b""
+                b"",
             )
 
-            # علامة ftyp تكون عادة في البايتات 4-7.
-            if len(first_bytes) < 8:
-                print("[URL_REJECT] Response too short.")
+            # علامة ftyp تكون عادة عند البايتات 4 إلى 7.
+            if len(first_bytes) < 8 or first_bytes[4:8] != b"ftyp":
+                print(f"[URL_REJECT] Invalid MP4 header: {target_url}")
                 return None
 
-            if first_bytes[4:8] != b"ftyp":
-                print("[URL_REJECT] MP4 signature not found.")
-                return None
-
-            # لا نقبل رابطًا أعاد توجيه الطلب إلى صفحة عامة.
             final_url = response.url
 
             if "/download/" not in final_url:
-                print("[URL_REJECT] Final URL is not a download URL.")
+                print(f"[URL_REJECT] Not a download URL: {final_url}")
                 return None
 
             return final_url
 
     except requests.RequestException as exc:
-        print(f"[URL_ERROR] {identifier}/{filename}: {exc}")
+        print(f"[URL_ERROR] {target_url}: {exc}")
         return None
 
 
-def discover_videos():
+def discover_videos(max_candidates):
+    if max_candidates <= 0:
+        return []
+
     query = (
         'mediatype:movies AND '
         '(subject:action OR subject:thriller OR '
@@ -153,13 +163,14 @@ def discover_videos():
                 ("fl[]", "title"),
                 ("rows", str(MAX_SEARCH_RESULTS)),
                 ("output", "json"),
-                ("page", "1")
+                ("page", "1"),
             ],
-            timeout=REQUEST_TIMEOUT
+            timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
-        data = response.json()
-        docs = data.get("response", {}).get("docs", [])
+        payload = response.json()
+
+        docs = payload.get("response", {}).get("docs", [])
 
         if not isinstance(docs, list):
             raise ValueError("Unexpected Internet Archive response")
@@ -168,11 +179,15 @@ def discover_videos():
         print(f"[SEARCH_ERROR] {exc}")
         return []
 
-    found = []
+    accepted = []
     seen_ids = set()
     seen_urls = set()
+    items_checked = 0
 
     for doc in docs:
+        if len(accepted) >= max_candidates:
+            break
+
         if not isinstance(doc, dict):
             continue
 
@@ -189,14 +204,13 @@ def discover_videos():
 
         seen_ids.add(identifier)
 
-        # هذه فلترة بالعنوان فقط وليست تحليلًا لمحتوى الفيديو.
         if not is_action_title(title):
             continue
 
         try:
             metadata_response = SESSION.get(
                 METADATA_URL.format(quote(identifier, safe="")),
-                timeout=REQUEST_TIMEOUT
+                timeout=REQUEST_TIMEOUT,
             )
             metadata_response.raise_for_status()
             metadata = metadata_response.json()
@@ -229,6 +243,8 @@ def discover_videos():
             if size <= 0:
                 continue
 
+            items_checked += 1
+
             video_url = verify_mp4_url(identifier, filename)
 
             if not video_url or video_url in seen_urls:
@@ -236,51 +252,56 @@ def discover_videos():
 
             seen_urls.add(video_url)
 
-            found.append({
+            accepted.append({
                 "video_url": video_url,
-                "caption": title[:2200]
+                "caption": title[:2200],
             })
 
-            if len(found) >= MAX_VIDEOS_PER_DAY:
-                print(f"[DISCOVERY] Candidates Passed: {len(found)}")
-                return found
-
-            # ملف MP4 صالح واحد لكل عنصر أرشيف.
+            # ملف واحد فقط من كل عنصر في الأرشيف.
             break
 
-    print(f"[DISCOVERY] Candidates Passed: {len(found)}")
-    return found
+    print(f"[DISCOVERY] files_checked={items_checked}")
+    print(f"[DISCOVERY] Candidates Passed: {len(accepted)}")
+
+    return accepted
 
 
 def get_today_rows(base_url, key):
-    now = datetime.now(timezone.utc)
+    today = datetime.now(timezone.utc).date()
+
     start = datetime.combine(
-        now.date(), time.min, tzinfo=timezone.utc
-    )
+        today,
+        time.min,
+        tzinfo=timezone.utc,
+    ).isoformat()
+
     end = datetime.combine(
-        now.date(), time.max, tzinfo=timezone.utc
-    )
+        today,
+        time.max,
+        tzinfo=timezone.utc,
+    ).isoformat()
 
     response = SESSION.get(
         f"{base_url}/rest/v1/generated_videos",
         headers=supabase_headers(key),
         params={
             "select": "id,video_url,created_at",
-            "created_at": f"gte.{start.isoformat()}",
-            "and": f"(created_at.lte.{end.isoformat()})",
-            "limit": "1000"
+            "created_at": f"gte.{start}",
+            "and": f"(created_at.lte.{end})",
+            "limit": str(MAX_DB_ROWS),
         },
-        timeout=REQUEST_TIMEOUT
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
+
     rows = response.json()
 
     if not isinstance(rows, list):
         raise ValueError("Invalid daily-count response")
 
-    if len(rows) >= 1000:
+    if len(rows) >= MAX_DB_ROWS:
         raise RuntimeError(
-            "Daily row count may be incomplete; stopping safely."
+            "Daily count may be incomplete; stopping safely."
         )
 
     return rows
@@ -293,11 +314,12 @@ def video_exists(base_url, key, video_url):
         params={
             "select": "id",
             "video_url": f"eq.{video_url}",
-            "limit": "1"
+            "limit": "1",
         },
-        timeout=REQUEST_TIMEOUT
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
+
     rows = response.json()
 
     if not isinstance(rows, list):
@@ -309,7 +331,7 @@ def video_exists(base_url, key, video_url):
 def insert_video(base_url, key, video):
     if DRY_RUN:
         raise RuntimeError(
-            "Safety stop: database insertion is disabled in DRY_RUN."
+            "Safety block: insertion is disabled in DRY_RUN."
         )
 
     response = SESSION.post(
@@ -318,23 +340,22 @@ def insert_video(base_url, key, video):
         json={
             "video_url": video["video_url"],
             "caption": video["caption"],
-            "status": "ready_to_publish"
+            "status": "ready_to_publish",
         },
-        timeout=REQUEST_TIMEOUT
+        timeout=REQUEST_TIMEOUT,
     )
     response.raise_for_status()
+
     result = response.json()
 
     if not isinstance(result, list) or not result:
-        raise RuntimeError("Database insert was not confirmed.")
+        raise RuntimeError("Insert was not confirmed by the API.")
 
     return result
 
 
 def main():
-    print(
-        f"[START] Trend Agent V15.1 | DRY_RUN={DRY_RUN}"
-    )
+    print(f"[START] Trend Agent V16.0 | DRY_RUN={DRY_RUN}")
 
     try:
         base_url = required_env("SUPABASE_URL")
@@ -350,13 +371,15 @@ def main():
             return 0
 
         remaining = MAX_VIDEOS_PER_DAY - daily_count
-        candidates = discover_videos()
+        candidates = discover_videos(remaining)
 
         if not candidates:
             print("[INFO] No valid video candidates found.")
+            print("[SUMMARY] processed=0 | database_write=0")
             return 0
 
         processed = 0
+        written = 0
 
         for video in candidates:
             if processed >= remaining:
@@ -376,10 +399,11 @@ def main():
             insert_video(base_url, key, video)
             print("[INSERTED]", url)
             processed += 1
+            written += 1
 
         print(
-            f"[SUMMARY] process={processed} | "
-            f"database_write={0 if DRY_RUN else processed}"
+            f"[SUMMARY] processed={processed} | "
+            f"database_write={written}"
         )
         return 0
 
@@ -387,7 +411,7 @@ def main():
         requests.RequestException,
         RuntimeError,
         ValueError,
-        KeyError
+        KeyError,
     ) as exc:
         print(f"[ERROR] {type(exc).__name__}: {exc}")
         return 1
