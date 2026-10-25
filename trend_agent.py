@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import re
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -27,8 +26,8 @@ USER_AGENT = "trend-agent-video-v1/2.0 (open-media discovery; contact configured
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-# Fail-safe: database writes remain disabled unless explicitly authorized later.
-DRY_RUN = os.environ.get("DRY_RUN", "true").strip().lower() not in {"0", "false", "no"}
+# Permanent safety invariant for this deliverable: dry-run cannot be disabled by environment variables.
+DRY_RUN = True
 
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
@@ -100,12 +99,6 @@ def load_state() -> dict[str, Any]:
     if not isinstance(state["processed_ids"], list):
         state["processed_ids"] = []
     return state
-
-
-def save_state(state: dict[str, Any]) -> None:
-    temp = STATE_FILE.with_suffix(".tmp")
-    temp.write_text(json.dumps(state, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    temp.replace(STATE_FILE)
 
 
 def license_is_open(license_url: str, license_text: str = "") -> bool:
@@ -184,12 +177,20 @@ def search_internet_archive(term: str, rows: int = 20, session: requests.Session
         return []
 
     results: list[dict[str, Any]] = []
+    rejected_missing_id = rejected_license = rejected_commercial = rejected_metadata = rejected_no_mp4 = 0
     for doc in docs:
         identifier = clean_text(doc.get("identifier"), 200)
         if not identifier:
+            rejected_missing_id += 1
             continue
         license_url = clean_text(doc.get("licenseurl"), 500)
         if not license_is_open(license_url):
+            rejected_license += 1
+            LOG.info("[IA_REJECT] identifier=%s reason=search_result_license_missing_or_unrecognized", identifier)
+            continue
+        if not license_allows_commercial_use(license_url):
+            rejected_commercial += 1
+            LOG.info("[IA_REJECT] identifier=%s reason=search_result_license_not_confirmed_commercial", identifier)
             continue
         try:
             meta_response = client.get(
@@ -198,15 +199,23 @@ def search_internet_archive(term: str, rows: int = 20, session: requests.Session
             check_source_response(meta_response, "Internet Archive metadata")
             metadata = meta_response.json()
         except (requests.RequestException, ValueError, AttributeError) as exc:
-            LOG.debug("Archive metadata unavailable for %s: %s", identifier, type(exc).__name__)
+            rejected_metadata += 1
+            LOG.warning("[IA_METADATA_FAIL] identifier=%s error=%s", identifier, type(exc).__name__)
             continue
 
         meta = metadata.get("metadata", {})
         actual_license = clean_text(meta.get("licenseurl") or license_url, 500)
         license_name = clean_text(meta.get("license") or "", 300)
         if not license_is_open(actual_license, license_name):
+            rejected_license += 1
+            LOG.info("[IA_REJECT] identifier=%s reason=license_missing_or_unrecognized", identifier)
+            continue
+        if not license_allows_commercial_use(actual_license):
+            rejected_commercial += 1
+            LOG.info("[IA_REJECT] identifier=%s reason=license_not_confirmed_commercial", identifier)
             continue
         files = metadata.get("files", [])
+        found_mp4 = False
         for file_info in files:
             name = clean_text(file_info.get("name"), 500)
             if not name.lower().endswith(".mp4") or file_info.get("private") == "true":
@@ -225,7 +234,11 @@ def search_internet_archive(term: str, rows: int = 20, session: requests.Session
                 "mime": "video/mp4",
                 "size_bytes": int(file_info.get("size", 0) or 0),
             })
+            found_mp4 = True
             break  # one MP4 per archive item
+        if not found_mp4:
+            rejected_no_mp4 += 1
+    LOG.info("[IA_SUMMARY] term=%r search_docs=%d accepted=%d missing_id=%d invalid_license=%d noncommercial_or_unknown=%d metadata_fail=%d no_mp4=%d", term, len(docs), len(results), rejected_missing_id, rejected_license, rejected_commercial, rejected_metadata, rejected_no_mp4)
     return results
 
 
@@ -247,18 +260,27 @@ def search_wikimedia_commons(term: str, limit: int = 30, session: requests.Sessi
         return []
 
     results: list[dict[str, Any]] = []
+    rejected_no_image = rejected_media = rejected_license = rejected_commercial = 0
     for page in pages.values():
         info_list = page.get("imageinfo") or []
         if not info_list:
+            rejected_no_image += 1
             continue
         info = info_list[0]
         media_url = clean_text(info.get("url"), 2000)
         if info.get("mime") != "video/mp4" or not is_allowed_media_url(media_url):
+            rejected_media += 1
             continue
         ext = info.get("extmetadata") or {}
         license_name = clean_text((ext.get("LicenseShortName") or {}).get("value", ""), 200)
         license_url = clean_text((ext.get("LicenseUrl") or {}).get("value", ""), 500)
         if not license_is_open(license_url, license_name):
+            rejected_license += 1
+            LOG.info("[COMMONS_REJECT] title=%s reason=license_missing_or_unrecognized", clean_text(page.get("title", ""), 100))
+            continue
+        if not license_allows_commercial_use(license_url):
+            rejected_commercial += 1
+            LOG.info("[COMMONS_REJECT] title=%s reason=license_not_confirmed_commercial", clean_text(page.get("title", ""), 100))
             continue
         results.append({
             "title": clean_text(page.get("title", ""), 500),
@@ -271,6 +293,7 @@ def search_wikimedia_commons(term: str, limit: int = 30, session: requests.Sessi
             "mime": "video/mp4",
             "size_bytes": int(info.get("size", 0) or 0),
         })
+    LOG.info("[COMMONS_SUMMARY] term=%r pages=%d accepted=%d no_imageinfo=%d invalid_media=%d invalid_license=%d noncommercial_or_unknown=%d", term, len(pages), len(results), rejected_no_image, rejected_media, rejected_license, rejected_commercial)
     return results
 
 
@@ -322,27 +345,27 @@ def recognized_license_url(license_url: str) -> str | None:
     return None
 
 
-def license_allows_automatic_publication(license_url: str, license_text: str = "") -> bool:
-    """Auto-approve only canonical CC0 or Public Domain Mark identifiers.
+def license_allows_commercial_use(license_url: str) -> bool:
+    """Accept only canonical CC0, CC BY, or CC BY-SA license URLs for commercial use.
 
-    Plain text such as 'Public Domain' and arbitrary URLs are deliberately
-    insufficient for automatic approval. Human review may still be needed to
-    confirm the source's authority and any jurisdiction-specific restrictions.
+    NonCommercial licenses, plain-text claims, unknown URLs, and Public Domain Mark
+    are not enough for this automated gate. This checks the stated license only; it
+    cannot prove that the uploader owns the copyright.
     """
     identifier = recognized_license_url(license_url)
     return identifier in {
         "/publicdomain/zero/1.0",
-        "/publicdomain/mark/1.0",
+        "/licenses/by/4.0", "/licenses/by-sa/4.0",
+        "/licenses/by/3.0", "/licenses/by-sa/3.0",
+        "/licenses/by/2.5", "/licenses/by-sa/2.5",
+        "/licenses/by/2.0", "/licenses/by-sa/2.0",
+        "/licenses/by/1.0", "/licenses/by-sa/1.0",
     }
 
 
 def make_record(candidate: dict[str, Any], probe: dict[str, Any]) -> dict[str, Any]:
     url = candidate["video_url"]
     video_id = stable_video_id(url)
-    auto_approved = license_allows_automatic_publication(
-        clean_text(candidate.get("license_url", ""), 500),
-        clean_text(candidate.get("license", ""), 300),
-    )
     return {
         "agent": AGENT_NAME,
         "record_type": "video_candidate",
@@ -360,8 +383,12 @@ def make_record(candidate: dict[str, Any], probe: dict[str, Any]) -> dict[str, A
         "link_check": probe,
         "discovered_at": utc_now().isoformat(),
         "status": "DISCOVERED",
-        "rights_verified": recognized_license_url(clean_text(candidate.get("license_url", ""), 500)) is not None,
-        "publication_approved": auto_approved,
+        # License metadata recognition is not proof of copyright ownership or authority.
+        "rights_verified": False,
+        "license_metadata_valid": recognized_license_url(clean_text(candidate.get("license_url", ""), 500)) is not None,
+        "commercial_use_allowed_by_stated_license": license_allows_commercial_use(clean_text(candidate.get("license_url", ""), 500)),
+        # No automatic publication approval without an independent rights-holder check.
+        "publication_approved": False,
     }
 
 
@@ -432,21 +459,8 @@ def recorded_video_ids(session: requests.Session | None = None) -> set[str]:
 
 
 def insert_record(record: dict[str, Any], session: requests.Session | None = None) -> None:
-    if DRY_RUN:
-        raise RuntimeError("DRY_RUN is enabled; Supabase writes are blocked")
-    client = session or SESSION
-    payload_text = json.dumps(record, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    # Validate serialization/parsing before the network write.
-    parsed = json.loads(payload_text)
-    if parsed.get("video_id") != record.get("video_id"):
-        raise ValueError("JSON round-trip validation failed")
-    response = client.post(
-        f"{SUPABASE_URL}/rest/v1/payment_events",
-        headers=supabase_headers(),
-        json={"provider": AGENT_NAME, "provider_payment_id": payload_text},
-        timeout=REQUEST_TIMEOUT,
-    )
-    response.raise_for_status()
+    """Permanent hard stop: this agent is prohibited from writing to Supabase."""
+    raise RuntimeError("Supabase writes are permanently disabled in this agent")
 
 
 def discover_candidates() -> Iterable[dict[str, Any]]:
@@ -463,65 +477,56 @@ def discover_candidates() -> Iterable[dict[str, Any]]:
 
 
 def run_agent() -> dict[str, Any]:
-    """Find up to three verified, nonduplicate candidates; dry-run never writes."""
-    headers = supabase_headers()  # fail fast if credentials are absent
+    """Read-only diagnostic preview. Never writes to Supabase or local state."""
+    headers = supabase_headers()  # read credentials required for the existing dedupe snapshot
     del headers
-    state = load_state()
+    _state = load_state()  # read-only; used only for duplicate suppression
     db_ids, count = database_snapshot()
-    processed = set(str(value) for value in state["processed_ids"])
+    processed = set(str(value) for value in _state["processed_ids"])
     processed.update(db_ids)
-    added = 0
     previewed = 0
+    discovered = 0
+    rejected_duplicate = rejected_probe = rejected_url = rejected_license = 0
 
     if count >= DAILY_TARGET:
         LOG.info("Daily target already reached (%s/%s)", count, DAILY_TARGET)
         return {"status": "TARGET_ALREADY_REACHED", "added": 0, "previewed": 0, "daily_count": count, "target": DAILY_TARGET}
 
     for candidate in discover_candidates():
-        if (count + previewed if DRY_RUN else count) >= DAILY_TARGET:
+        discovered += 1
+        if count + previewed >= DAILY_TARGET:
             break
         url = candidate.get("video_url", "")
         if not is_allowed_media_url(url):
+            rejected_url += 1
+            LOG.info("[CANDIDATE_REJECT] reason=media_url_not_allowed")
+            continue
+        license_url = clean_text(candidate.get("license_url", ""), 500)
+        if not license_allows_commercial_use(license_url):
+            rejected_license += 1
+            LOG.info("[CANDIDATE_REJECT] reason=license_not_confirmed_commercial title=%s", clean_text(candidate.get("title", ""), 100))
             continue
         video_id = stable_video_id(url)
-        if video_id in processed or video_id in db_ids:
+        if video_id in processed:
+            rejected_duplicate += 1
+            LOG.info("[CANDIDATE_REJECT] reason=duplicate video_id=%s", video_id[:12])
             continue
         probe = check_video_url(url)
         if not probe.get("ok"):
-            LOG.info("Skipping failed media URL (%s): %s", url, probe.get("reason"))
+            rejected_probe += 1
+            LOG.info("[CANDIDATE_REJECT] reason=media_probe_failed detail=%s", probe.get("reason"))
             continue
         record = make_record(candidate, probe)
-        if DRY_RUN:
-            previewed += 1
-            LOG.info("DRY_RUN preview %s/%s: title=%s rights_verified=%s publication_approved=%s",
-                     count + previewed, DAILY_TARGET, clean_text(candidate.get("title", ""), 100),
-                     record["rights_verified"], record["publication_approved"])
-            continue
-        try:
-            insert_record(record)
-        except (requests.RequestException, RuntimeError, ValueError) as exc:
-            LOG.error("Supabase insert failed for video %s: %s; stopping to avoid silent data loss", video_id[:12], type(exc).__name__)
-            raise
-        processed.add(video_id)
-        db_ids.add(video_id)
-        count += 1
-        added += 1
-        state.update({"day": utc_day(), "daily_count": count, "processed_ids": sorted(processed)})
-        save_state(state)
-        LOG.info("Recorded verified candidate %s/%s: %s", count, DAILY_TARGET, clean_text(candidate.get("title", ""), 100))
-        time.sleep(0.5)
+        previewed += 1
+        LOG.info("DRY_RUN preview %s/%s: title=%s license_metadata_valid=%s commercial_use_allowed=%s rights_verified=%s publication_approved=%s",
+                 count + previewed, DAILY_TARGET, clean_text(candidate.get("title", ""), 100),
+                 record["license_metadata_valid"], record["commercial_use_allowed_by_stated_license"],
+                 record["rights_verified"], record["publication_approved"])
 
-    if DRY_RUN:
-        report = {"status": "DRY_RUN_PREVIEW", "added": 0, "previewed": previewed, "daily_count": count, "target": DAILY_TARGET}
-        LOG.info("DRY_RUN enabled: no Supabase writes and no local state changes")
-        return report
-
-    state.update({"day": utc_day(), "daily_count": count, "processed_ids": sorted(processed)})
-    save_state(state)
-    status = "TARGET_REACHED" if count >= DAILY_TARGET else "TARGET_NOT_REACHED"
-    report = {"status": status, "added": added, "daily_count": count, "target": DAILY_TARGET}
-    if status != "TARGET_REACHED":
-        LOG.warning("Daily target not reached: %s/%s verified records; no placeholders were inserted", count, DAILY_TARGET)
+    LOG.info("[DISCOVERY_SUMMARY] yielded=%d previewed=%d rejected_url=%d rejected_license=%d rejected_duplicate=%d rejected_probe=%d daily_count=%d target=%d",
+             discovered, previewed, rejected_url, rejected_license, rejected_duplicate, rejected_probe, count, DAILY_TARGET)
+    report = {"status": "DRY_RUN_PREVIEW", "added": 0, "previewed": previewed, "daily_count": count, "target": DAILY_TARGET}
+    LOG.info("DRY_RUN permanently enabled: no Supabase writes and no local state changes")
     return report
 
 
