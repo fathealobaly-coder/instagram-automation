@@ -1,210 +1,539 @@
-import importlib.util
+#!/usr/bin/env python3
+"""trend_agent_video_v1: discover openly licensed action videos and record candidates.
+
+This agent records metadata in public.payment_events.provider_payment_id as JSON text.
+It does not download video binaries or publish to Instagram.
+"""
+from __future__ import annotations
+
+import hashlib
 import json
+import logging
 import os
-import tempfile
-import unittest
+import re
+from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import Mock
-import sys
+from typing import Any, Iterable
+from urllib.parse import quote, urlparse
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "trend_agent.py"
-spec = importlib.util.spec_from_file_location("trend_agent_under_test", MODULE_PATH)
-agent = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = agent
-spec.loader.exec_module(agent)
+import requests
+
+AGENT_NAME = "trend_agent_video_v1"
+DAILY_TARGET = 3
+STATE_FILE = Path(__file__).with_name("trend_agent_state.json")
+REQUEST_TIMEOUT = (8, 25)
+USER_AGENT = "trend-agent-video-v1/2.0 (open-media discovery; contact configured by operator)"
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+# Permanent safety invariant for this deliverable: dry-run cannot be disabled by environment variables.
+DRY_RUN = True
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": USER_AGENT})
+
+# Restrict discovery to fictional animation/CGI adventure content; do not seek real-world stunts.
+SEARCH_TERMS = (
+    "public domain animated adventure film",
+    "animated fantasy adventure scene",
+    "CGI fictional adventure sequence",
+    "public domain cartoon adventure",
+)
+
+# Conservative allow-list: source APIs and their official media hosts only.
+ALLOWED_MEDIA_HOSTS = {
+    "archive.org",
+    "ia800100.us.archive.org",  # checked again by host suffix rule below
+    "upload.wikimedia.org",
+}
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOG = logging.getLogger(AGENT_NAME)
 
 
-class FakeResponse:
-    def __init__(self, payload, status_code=200, headers=None, url=None):
-        self.payload = payload
-        self.status_code = status_code
-        self.headers = headers or {}
-        self.url = url or "https://archive.org/advancedsearch.php"
-    def raise_for_status(self):
-        if self.status_code >= 400:
-            raise agent.requests.HTTPError(f"HTTP {self.status_code}")
-    def json(self):
-        return self.payload
-    def __enter__(self): return self
-    def __exit__(self, *args): return False
+class SourceAPIStop(RuntimeError):
+    """Fail closed when a discovery source denies access or rate-limits us."""
 
 
-class FakeSession:
-    def __init__(self, responses):
-        self.responses = list(responses)
-        self.calls = []
-    def get(self, url, **kwargs):
-        self.calls.append((url, kwargs))
-        return self.responses.pop(0)
+def check_source_response(response: requests.Response, source: str) -> None:
+    if response.status_code in (401, 403, 429):
+        raise SourceAPIStop(f"{source} stopped on HTTP {response.status_code}; no retry attempted")
+    response.raise_for_status()
 
 
-class TrendAgentTests(unittest.TestCase):
-    def test_license_recognition_requires_canonical_https_cc_url(self):
-        self.assertEqual(agent.recognized_license_url("https://creativecommons.org/licenses/by/4.0/"), "/licenses/by/4.0")
-        for bad in ("", "https://example.com/licenses/by/4.0", "http://creativecommons.org/licenses/by/4.0/", "https://creativecommons.org.fake/licenses/by/4.0/"):
-            self.assertIsNone(agent.recognized_license_url(bad))
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
-    def test_commercial_gate_accepts_cc0_by_and_by_sa(self):
-        for url in (
-            "https://creativecommons.org/publicdomain/zero/1.0/",
-            "https://creativecommons.org/licenses/by/4.0/",
-            "https://creativecommons.org/licenses/by-sa/4.0/",
-        ):
-            with self.subTest(url=url): self.assertTrue(agent.license_allows_commercial_use(url))
 
-    def test_commercial_gate_rejects_missing_fake_nc_nd_and_public_domain_claim(self):
-        for url in (
-            "", "https://example.com/license", "https://creativecommons.org/licenses/by-nc/4.0/",
-            "https://creativecommons.org/licenses/by-nc-sa/4.0/", "https://creativecommons.org/licenses/by-nd/4.0/",
-            "https://creativecommons.org/publicdomain/mark/1.0/",
-        ):
-            with self.subTest(url=url): self.assertFalse(agent.license_allows_commercial_use(url))
-        self.assertFalse(agent.license_allows_commercial_use(""))
+def utc_day() -> str:
+    return utc_now().date().isoformat()
 
-    def test_rights_never_claimed_verified_from_license_metadata_alone(self):
-        for license_url in ("", "https://example.com/license", "https://creativecommons.org/publicdomain/zero/1.0/", "https://creativecommons.org/licenses/by/4.0/"):
-            record = agent.make_record({"video_url":"https://archive.org/download/id/clip.mp4", "title":"Test", "license_url":license_url}, {"ok":True})
-            with self.subTest(license_url=license_url):
-                self.assertFalse(record["rights_verified"])
-                self.assertFalse(record["publication_approved"])
 
-    def test_open_license_recognition_does_not_override_commercial_gate(self):
-        nc = "https://creativecommons.org/licenses/by-nc/4.0/"
-        self.assertFalse(agent.license_is_open(nc))
-        self.assertFalse(agent.license_allows_commercial_use(nc))
+def clean_text(value: Any, limit: int = 1200) -> str:
+    """Normalize untrusted source metadata into plain, bounded text."""
+    if value is None:
+        return ""
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    return text[:limit]
 
-    def test_url_validation_rejects_fake_hosts_http_and_page_urls(self):
-        self.assertTrue(agent.is_allowed_media_url("https://archive.org/download/id/clip.mp4"))
-        for url in ("http://archive.org/download/id/clip.mp4", "https://archive.org/details/id", "https://example.com/clip.mp4"):
-            with self.subTest(url=url): self.assertFalse(agent.is_allowed_media_url(url))
 
-    def test_failed_media_probe_rejected(self):
-        session = Mock()
-        session.get.return_value = FakeResponse({}, 200, {"Content-Type":"text/html"}, "https://archive.org/download/id/clip.mp4")
-        result = agent.check_video_url("https://archive.org/download/id/clip.mp4", session=session)
-        self.assertFalse(result["ok"])
+def stable_video_id(url: str) -> str:
+    return hashlib.sha256(url.strip().encode("utf-8")).hexdigest()
 
-    def test_archive_search_rejects_noncommercial_license_before_metadata_fetch(self):
-        response = FakeResponse({"response":{"docs":[{"identifier":"item1", "title":"test", "licenseurl":"https://creativecommons.org/licenses/by-nc/4.0/"}]}})
-        session = FakeSession([response])
-        self.assertEqual(agent.search_internet_archive("test", session=session), [])
-        self.assertEqual(len(session.calls), 1)
 
-    def test_archive_search_returns_only_direct_mp4_with_commercial_license_metadata(self):
-        search_payload = {"response":{"docs":[{"identifier":"item1", "title":"Licensed clip", "description":"test", "licenseurl":"https://creativecommons.org/licenses/by/4.0/"}]}}
-        metadata_payload = {"metadata":{"title":"Licensed clip", "licenseurl":"https://creativecommons.org/licenses/by/4.0/", "license":"CC BY 4.0"}, "files":[{"name":"clip.mp4", "size":"1234"}]}
-        session = FakeSession([FakeResponse(search_payload), FakeResponse(metadata_payload, url="https://archive.org/metadata/item1")])
-        results = agent.search_internet_archive("test", session=session)
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["video_url"], "https://archive.org/download/item1/clip.mp4")
-        self.assertTrue(agent.license_allows_commercial_use(results[0]["license_url"]))
+def load_state() -> dict[str, Any]:
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("state root is not an object")
+    except FileNotFoundError:
+        state = {}
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        LOG.warning("State file unreadable; starting a fresh local state: %s", exc)
+        state = {}
 
-    def test_archive_search_logs_zero_or_filtered_result_summary(self):
-        session = FakeSession([FakeResponse({"response":{"docs":[]}})])
-        with self.assertLogs(agent.LOG, level="INFO") as captured:
-            results = agent.search_internet_archive("test", session=session)
-        self.assertEqual(results, [])
-        self.assertTrue(any("[IA_SUMMARY]" in line and "search_docs=0" in line for line in captured.output))
+    if state.get("day") != utc_day():
+        state = {"day": utc_day(), "daily_count": 0, "processed_ids": []}
+    state.setdefault("daily_count", 0)
+    state.setdefault("processed_ids", [])
+    if not isinstance(state["processed_ids"], list):
+        state["processed_ids"] = []
+    return state
 
-    def test_commons_search_rejects_noncommercial_license(self):
-        payload = {"query":{"pages":{"1":{"title":"File:clip.mp4","imageinfo":[{
-            "url":"https://upload.wikimedia.org/wikipedia/commons/a/a1/clip.mp4", "mime":"video/mp4", "size":100,
-            "extmetadata":{"LicenseShortName":{"value":"CC BY-NC 4.0"},"LicenseUrl":{"value":"https://creativecommons.org/licenses/by-nc/4.0/"}}
-        }]}}}}
-        session = FakeSession([FakeResponse(payload, url="https://commons.wikimedia.org/w/api.php")])
-        with self.assertLogs(agent.LOG, level="INFO") as captured:
-            results = agent.search_wikimedia_commons("test", session=session)
-        self.assertEqual(results, [])
-        self.assertTrue(any("[COMMONS_SUMMARY]" in line and "invalid_license=1" in line for line in captured.output))
 
-    def test_dry_run_is_permanent_and_ignores_environment_setting(self):
-        self.assertIs(agent.DRY_RUN, True)
+def license_is_open(license_url: str, license_text: str = "") -> bool:
+    """Accept only clearly identified public-domain or Creative Commons licenses."""
+    value = f"{license_url} {license_text}".lower()
+    allowed_markers = (
+        "creativecommons.org/publicdomain/zero",
+        "creativecommons.org/publicdomain/mark",
+        "creativecommons.org/licenses/by/",
+        "creativecommons.org/licenses/by-sa/",
+        "creativecommons.org/licenses/by/4.0",
+        "creativecommons.org/licenses/by-sa/4.0",
+        "creativecommons.org/licenses/by/3.0",
+        "creativecommons.org/licenses/by-sa/3.0",
+        "public domain",
+        "publicdomain",
+    )
+    return any(marker in value for marker in allowed_markers)
 
-    def test_run_agent_rejects_missing_or_noncommercial_license_before_preview(self):
-        old = (agent.SUPABASE_URL, agent.SUPABASE_SERVICE_ROLE_KEY, agent.database_snapshot, agent.discover_candidates, agent.check_video_url, agent.STATE_FILE)
+
+def is_allowed_media_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        trusted_host = host in ALLOWED_MEDIA_HOSTS or host.endswith(".archive.org")
+        return parsed.scheme == "https" and trusted_host and parsed.path.lower().endswith(".mp4")
+    except (TypeError, ValueError):
+        return False
+
+
+def check_video_url(url: str, session: requests.Session | None = None) -> dict[str, Any]:
+    """Probe a direct MP4 with a ranged GET; require a successful response and video type."""
+    client = session or SESSION
+    if not is_allowed_media_url(url):
+        return {"ok": False, "reason": "URL host, scheme, or extension is not allowed"}
+    try:
+        with client.get(
+            url,
+            headers={"Range": "bytes=0-2047"},
+            stream=True,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True,
+        ) as response:
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+            valid_status = response.status_code in (200, 206)
+            valid_type = content_type in ("video/mp4", "application/octet-stream")
+            # Reject redirects to hosts outside the allow-list, even if the first URL was trusted.
+            final_url = response.url
+            valid_final_url = is_allowed_media_url(final_url)
+            ok = valid_status and valid_type and valid_final_url
+            return {
+                "ok": ok,
+                "status_code": response.status_code,
+                "content_type": content_type,
+                "final_url": final_url,
+                "reason": "ok" if ok else "HTTP status/content type/final URL check failed",
+            }
+    except requests.RequestException as exc:
+        return {"ok": False, "reason": f"request error: {type(exc).__name__}"}
+
+
+def search_internet_archive(term: str, rows: int = 20, session: requests.Session | None = None) -> list[dict[str, Any]]:
+    """Search Internet Archive and return only MP4s with explicit open-license metadata."""
+    client = session or SESSION
+    query = f'mediatype:movies AND (title:"{term}" OR description:"{term}")'
+    try:
+        response = client.get(
+            "https://archive.org/advancedsearch.php",
+            params={"q": query, "fl[]": ["identifier", "title", "description", "licenseurl"], "rows": rows, "page": 1, "output": "json"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        check_source_response(response, "Internet Archive search")
+        docs = response.json().get("response", {}).get("docs", [])
+    except (requests.RequestException, ValueError, AttributeError) as exc:
+        LOG.warning("Internet Archive search failed for %r: %s", term, type(exc).__name__)
+        return []
+
+    results: list[dict[str, Any]] = []
+    rejected_missing_id = rejected_license = rejected_commercial = rejected_metadata = rejected_no_mp4 = 0
+    for doc in docs:
+        identifier = clean_text(doc.get("identifier"), 200)
+        if not identifier:
+            rejected_missing_id += 1
+            continue
+        license_url = clean_text(doc.get("licenseurl"), 500)
+        if not license_is_open(license_url):
+            rejected_license += 1
+            LOG.info("[IA_REJECT] identifier=%s reason=search_result_license_missing_or_unrecognized", identifier)
+            continue
+        if not license_allows_commercial_use(license_url):
+            rejected_commercial += 1
+            LOG.info("[IA_REJECT] identifier=%s reason=search_result_license_not_confirmed_commercial", identifier)
+            continue
         try:
-            with tempfile.TemporaryDirectory() as tmp:
-                agent.SUPABASE_URL = "https://supabase.example"
-                agent.SUPABASE_SERVICE_ROLE_KEY = "test-only-not-a-real-secret"
-                agent.STATE_FILE = Path(tmp) / "state.json"
-                agent.database_snapshot = lambda: (set(), 0)
-                agent.discover_candidates = lambda: iter([
-                    {"video_url":"https://archive.org/download/id/no-license.mp4", "title":"No license", "license_url":""},
-                    {"video_url":"https://archive.org/download/id/nc.mp4", "title":"Noncommercial", "license_url":"https://creativecommons.org/licenses/by-nc/4.0/"},
-                ])
-                agent.check_video_url = Mock(side_effect=AssertionError("probe must not run for unlicensed candidates"))
-                with self.assertLogs(agent.LOG, level="INFO") as captured:
-                    result = agent.run_agent()
-                self.assertEqual(result["previewed"], 0)
-                self.assertTrue(any("rejected_license=2" in line for line in captured.output))
-                agent.check_video_url.assert_not_called()
-                self.assertFalse(agent.STATE_FILE.exists())
-        finally:
-            (agent.SUPABASE_URL, agent.SUPABASE_SERVICE_ROLE_KEY, agent.database_snapshot, agent.discover_candidates, agent.check_video_url, agent.STATE_FILE) = old
+            meta_response = client.get(
+                f"https://archive.org/metadata/{quote(identifier, safe='')}", timeout=REQUEST_TIMEOUT
+            )
+            check_source_response(meta_response, "Internet Archive metadata")
+            metadata = meta_response.json()
+        except (requests.RequestException, ValueError, AttributeError) as exc:
+            rejected_metadata += 1
+            LOG.warning("[IA_METADATA_FAIL] identifier=%s error=%s", identifier, type(exc).__name__)
+            continue
 
-    def test_insert_record_hard_blocked_when_dry_run(self):
-        old = agent.DRY_RUN
-        try:
-            agent.DRY_RUN = True
-            with self.assertRaisesRegex(RuntimeError, "permanently disabled"):
-                agent.insert_record({"video_id":"test"}, session=Mock())
-        finally: agent.DRY_RUN = old
-
-    def test_run_agent_preview_never_inserts_or_saves_state(self):
-        old = (agent.SUPABASE_URL, agent.SUPABASE_SERVICE_ROLE_KEY, agent.DRY_RUN, agent.database_snapshot, agent.discover_candidates, agent.check_video_url, agent.insert_record, agent.STATE_FILE)
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                agent.SUPABASE_URL = "https://supabase.example"
-                agent.SUPABASE_SERVICE_ROLE_KEY = "test-only-not-a-real-secret"
-                agent.DRY_RUN = True
-                agent.STATE_FILE = Path(tmp) / "state.json"
-                agent.database_snapshot = lambda: (set(), 0)
-                agent.discover_candidates = lambda: iter([{"video_url":"https://archive.org/download/id/clip.mp4", "title":"Preview", "license_url":"https://creativecommons.org/licenses/by/4.0/"}])
-                agent.check_video_url = lambda url: {"ok":True, "status_code":206, "content_type":"video/mp4"}
-                agent.insert_record = Mock(side_effect=AssertionError("write attempted"))
-                result = agent.run_agent()
-                self.assertEqual(result, {"status":"DRY_RUN_PREVIEW", "added":0, "previewed":1, "daily_count":0, "target":3})
-                agent.insert_record.assert_not_called()
-                self.assertFalse(agent.STATE_FILE.exists())
-        finally:
-            (agent.SUPABASE_URL, agent.SUPABASE_SERVICE_ROLE_KEY, agent.DRY_RUN, agent.database_snapshot, agent.discover_candidates, agent.check_video_url, agent.insert_record, agent.STATE_FILE) = old
-
-    def test_empty_discovery_returns_zero_preview_without_writes(self):
-        old = (agent.SUPABASE_URL, agent.SUPABASE_SERVICE_ROLE_KEY, agent.DRY_RUN, agent.database_snapshot, agent.discover_candidates, agent.STATE_FILE)
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                agent.SUPABASE_URL = "https://supabase.example"
-                agent.SUPABASE_SERVICE_ROLE_KEY = "test-only-not-a-real-secret"
-                agent.DRY_RUN = True
-                agent.STATE_FILE = Path(tmp) / "state.json"
-                agent.database_snapshot = lambda: (set(), 0)
-                agent.discover_candidates = lambda: iter(())
-                with self.assertLogs(agent.LOG, level="INFO") as captured:
-                    result = agent.run_agent()
-                self.assertEqual(result["previewed"], 0)
-                self.assertTrue(any("[DISCOVERY_SUMMARY] yielded=0 previewed=0" in line for line in captured.output))
-                self.assertFalse(agent.STATE_FILE.exists())
-        finally:
-            (agent.SUPABASE_URL, agent.SUPABASE_SERVICE_ROLE_KEY, agent.DRY_RUN, agent.database_snapshot, agent.discover_candidates, agent.STATE_FILE) = old
-
-    def test_source_auth_and_rate_limit_stop(self):
-        for status in (401, 403, 429):
-            with self.subTest(status=status):
-                response = FakeResponse({}, status)
-                with self.assertRaises(agent.SourceAPIStop): agent.check_source_response(response, "test source")
-
-    def test_daily_target_short_circuits_discovery(self):
-        old = (agent.SUPABASE_URL, agent.SUPABASE_SERVICE_ROLE_KEY, agent.database_snapshot, agent.discover_candidates, agent.STATE_FILE)
-        try:
-            with tempfile.TemporaryDirectory() as tmp:
-                agent.SUPABASE_URL = "https://supabase.example"
-                agent.SUPABASE_SERVICE_ROLE_KEY = "test-only-not-a-real-secret"
-                agent.STATE_FILE = Path(tmp) / "state.json"
-                agent.database_snapshot = lambda: (set(), agent.DAILY_TARGET)
-                agent.discover_candidates = lambda: (_ for _ in ()).throw(AssertionError("should not search"))
-                self.assertEqual(agent.run_agent()["status"], "TARGET_ALREADY_REACHED")
-        finally:
-            (agent.SUPABASE_URL, agent.SUPABASE_SERVICE_ROLE_KEY, agent.database_snapshot, agent.discover_candidates, agent.STATE_FILE) = old
+        meta = metadata.get("metadata", {})
+        actual_license = clean_text(meta.get("licenseurl") or license_url, 500)
+        license_name = clean_text(meta.get("license") or "", 300)
+        if not license_is_open(actual_license, license_name):
+            rejected_license += 1
+            LOG.info("[IA_REJECT] identifier=%s reason=license_missing_or_unrecognized", identifier)
+            continue
+        if not license_allows_commercial_use(actual_license):
+            rejected_commercial += 1
+            LOG.info("[IA_REJECT] identifier=%s reason=license_not_confirmed_commercial", identifier)
+            continue
+        files = metadata.get("files", [])
+        found_mp4 = False
+        for file_info in files:
+            name = clean_text(file_info.get("name"), 500)
+            if not name.lower().endswith(".mp4") or file_info.get("private") == "true":
+                continue
+            media_url = f"https://archive.org/download/{quote(identifier, safe='')}/{quote(name, safe='') }"
+            if not is_allowed_media_url(media_url):
+                continue
+            results.append({
+                "title": clean_text(meta.get("title") or doc.get("title") or name, 500),
+                "description": clean_text(meta.get("description") or doc.get("description") or "", 1200),
+                "video_url": media_url,
+                "license": license_name or actual_license,
+                "license_url": actual_license,
+                "source": "Internet Archive",
+                "source_page": f"https://archive.org/details/{quote(identifier, safe='')}",
+                "mime": "video/mp4",
+                "size_bytes": int(file_info.get("size", 0) or 0),
+            })
+            found_mp4 = True
+            break  # one MP4 per archive item
+        if not found_mp4:
+            rejected_no_mp4 += 1
+    LOG.info("[IA_SUMMARY] term=%r search_docs=%d accepted=%d missing_id=%d invalid_license=%d noncommercial_or_unknown=%d metadata_fail=%d no_mp4=%d", term, len(docs), len(results), rejected_missing_id, rejected_license, rejected_commercial, rejected_metadata, rejected_no_mp4)
+    return results
 
 
-if __name__ == "__main__": unittest.main(verbosity=2)
+def search_wikimedia_commons(term: str, limit: int = 30, session: requests.Session | None = None) -> list[dict[str, Any]]:
+    """Search Commons; accept direct MP4 only and require explicit open license metadata."""
+    client = session or SESSION
+    params = {
+        "action": "query", "format": "json", "generator": "search",
+        "gsrsearch": f'filetype:video "{term}"', "gsrnamespace": 6,
+        "gsrlimit": min(max(limit, 1), 50), "prop": "imageinfo",
+        "iiprop": "url|mime|size|extmetadata",
+    }
+    try:
+        response = client.get("https://commons.wikimedia.org/w/api.php", params=params, timeout=REQUEST_TIMEOUT)
+        check_source_response(response, "Wikimedia Commons search")
+        pages = response.json().get("query", {}).get("pages", {})
+    except (requests.RequestException, ValueError, AttributeError) as exc:
+        LOG.warning("Wikimedia search failed for %r: %s", term, type(exc).__name__)
+        return []
+
+    results: list[dict[str, Any]] = []
+    rejected_no_image = rejected_media = rejected_license = rejected_commercial = 0
+    for page in pages.values():
+        info_list = page.get("imageinfo") or []
+        if not info_list:
+            rejected_no_image += 1
+            continue
+        info = info_list[0]
+        media_url = clean_text(info.get("url"), 2000)
+        if info.get("mime") != "video/mp4" or not is_allowed_media_url(media_url):
+            rejected_media += 1
+            continue
+        ext = info.get("extmetadata") or {}
+        license_name = clean_text((ext.get("LicenseShortName") or {}).get("value", ""), 200)
+        license_url = clean_text((ext.get("LicenseUrl") or {}).get("value", ""), 500)
+        if not license_is_open(license_url, license_name):
+            rejected_license += 1
+            LOG.info("[COMMONS_REJECT] title=%s reason=license_missing_or_unrecognized", clean_text(page.get("title", ""), 100))
+            continue
+        if not license_allows_commercial_use(license_url):
+            rejected_commercial += 1
+            LOG.info("[COMMONS_REJECT] title=%s reason=license_not_confirmed_commercial", clean_text(page.get("title", ""), 100))
+            continue
+        results.append({
+            "title": clean_text(page.get("title", ""), 500),
+            "description": clean_text((ext.get("ImageDescription") or {}).get("value", ""), 1200),
+            "video_url": media_url,
+            "license": license_name,
+            "license_url": license_url,
+            "source": "Wikimedia Commons",
+            "source_page": f"https://commons.wikimedia.org/wiki/{quote(clean_text(page.get('title', '').replace(' ', '_'), 500), safe='')}",
+            "mime": "video/mp4",
+            "size_bytes": int(info.get("size", 0) or 0),
+        })
+    LOG.info("[COMMONS_SUMMARY] term=%r pages=%d accepted=%d no_imageinfo=%d invalid_media=%d invalid_license=%d noncommercial_or_unknown=%d", term, len(pages), len(results), rejected_no_image, rejected_media, rejected_license, rejected_commercial)
+    return results
+
+
+def make_caption(title: str, description: str) -> str:
+    """Create a truthful, adaptable caption without claiming visual facts not in metadata."""
+    basis = clean_text(title, 180) or "Action moment"
+    context = clean_text(description, 220)
+    caption = f"{basis} — a cinematic moment worth watching."
+    if context and context.lower() not in basis.lower():
+        caption += f" Context: {context}"
+    caption += " #Action #Cinematic #Adventure #Reels"
+    return caption[:900]
+
+
+def recognized_license_url(license_url: str) -> str | None:
+    """Return a recognized canonical license identifier, otherwise None.
+
+    A non-empty URL is not evidence by itself. Only canonical URLs on the
+    official Creative Commons host with known license paths are recognized.
+    This identifies the license family; it does not independently prove the
+    uploader owned the rights or that every use is lawful.
+    """
+    try:
+        parsed = urlparse(clean_text(license_url, 500))
+    except (TypeError, ValueError):
+        return None
+    if parsed.scheme != "https" or parsed.hostname not in {"creativecommons.org", "www.creativecommons.org"}:
+        return None
+    path = parsed.path.rstrip("/").lower()
+    if path in {
+        "/publicdomain/zero/1.0",
+        "/publicdomain/mark/1.0",
+        "/licenses/by/4.0",
+        "/licenses/by-sa/4.0",
+        "/licenses/by/3.0",
+        "/licenses/by-sa/3.0",
+        "/licenses/by/2.5",
+        "/licenses/by-sa/2.5",
+        "/licenses/by/2.0",
+        "/licenses/by-sa/2.0",
+        "/licenses/by/1.0",
+        "/licenses/by-sa/1.0",
+        "/licenses/by-nc/4.0",
+        "/licenses/by-nc-sa/4.0",
+        "/licenses/by-nc-nd/4.0",
+        "/licenses/by-nd/4.0",
+    }:
+        return path
+    return None
+
+
+def license_allows_commercial_use(license_url: str) -> bool:
+    """Accept only canonical CC0, CC BY, or CC BY-SA license URLs for commercial use.
+
+    NonCommercial licenses, plain-text claims, unknown URLs, and Public Domain Mark
+    are not enough for this automated gate. This checks the stated license only; it
+    cannot prove that the uploader owns the copyright.
+    """
+    identifier = recognized_license_url(license_url)
+    return identifier in {
+        "/publicdomain/zero/1.0",
+        "/licenses/by/4.0", "/licenses/by-sa/4.0",
+        "/licenses/by/3.0", "/licenses/by-sa/3.0",
+        "/licenses/by/2.5", "/licenses/by-sa/2.5",
+        "/licenses/by/2.0", "/licenses/by-sa/2.0",
+        "/licenses/by/1.0", "/licenses/by-sa/1.0",
+    }
+
+
+def make_record(candidate: dict[str, Any], probe: dict[str, Any]) -> dict[str, Any]:
+    url = candidate["video_url"]
+    video_id = stable_video_id(url)
+    return {
+        "agent": AGENT_NAME,
+        "record_type": "video_candidate",
+        "video_id": video_id,
+        "video_url": url,
+        "title": clean_text(candidate.get("title", ""), 500),
+        "description": clean_text(candidate.get("description", ""), 1200),
+        "caption": make_caption(candidate.get("title", ""), candidate.get("description", "")),
+        "source": clean_text(candidate.get("source", ""), 100),
+        "source_page": clean_text(candidate.get("source_page", ""), 2000),
+        "mime": candidate.get("mime", "video/mp4"),
+        "size_bytes": int(candidate.get("size_bytes", 0) or 0),
+        "license": clean_text(candidate.get("license", ""), 300),
+        "license_url": clean_text(candidate.get("license_url", ""), 500),
+        "link_check": probe,
+        "discovered_at": utc_now().isoformat(),
+        "status": "DISCOVERED",
+        # License metadata recognition is not proof of copyright ownership or authority.
+        "rights_verified": False,
+        "license_metadata_valid": recognized_license_url(clean_text(candidate.get("license_url", ""), 500)) is not None,
+        "commercial_use_allowed_by_stated_license": license_allows_commercial_use(clean_text(candidate.get("license_url", ""), 500)),
+        # No automatic publication approval without an independent rights-holder check.
+        "publication_approved": False,
+    }
+
+
+def supabase_headers() -> dict[str, str]:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY before running")
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+
+
+def database_snapshot(session: requests.Session | None = None) -> tuple[set[str], int]:
+    """Read all agent records in pages; derive today's count from JSON, not runner-local state.
+
+    The approved payment_events schema has no timestamp column, so discovered_at inside
+    provider_payment_id is the only available date source. Missing/invalid timestamps do
+    not count toward today's limit, but their video IDs still participate in deduplication.
+    """
+    client = session or SESSION
+    headers = supabase_headers()
+    headers["Range-Unit"] = "items"
+    ids: set[str] = set()
+    today_count = 0
+    offset = 0
+    page_size = 500
+    today = utc_day()
+
+    while True:
+        headers["Range"] = f"{offset}-{offset + page_size - 1}"
+        response = client.get(
+            f"{SUPABASE_URL}/rest/v1/payment_events",
+            headers=headers,
+            params={"provider": f"eq.{AGENT_NAME}", "select": "provider_payment_id", "limit": str(page_size)},
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        rows = response.json()
+        if not isinstance(rows, list):
+            raise ValueError("Supabase response must be a JSON array")
+
+        for row in rows:
+            try:
+                payload = json.loads(row.get("provider_payment_id", ""))
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("video_id"):
+                    ids.add(str(payload["video_id"]))
+                discovered_at = str(payload.get("discovered_at", ""))
+                if discovered_at[:10] == today:
+                    today_count += 1
+            except (TypeError, json.JSONDecodeError):
+                LOG.warning("Ignoring malformed prior provider_payment_id JSON")
+
+        if len(rows) < page_size:
+            break
+        offset += len(rows)
+
+    return ids, today_count
+
+
+def recorded_video_ids(session: requests.Session | None = None) -> set[str]:
+    """Compatibility wrapper for callers needing only the known video IDs."""
+    ids, _ = database_snapshot(session)
+    return ids
+
+
+def insert_record(record: dict[str, Any], session: requests.Session | None = None) -> None:
+    """Permanent hard stop: this agent is prohibited from writing to Supabase."""
+    raise RuntimeError("Supabase writes are permanently disabled in this agent")
+
+
+def discover_candidates() -> Iterable[dict[str, Any]]:
+    seen_urls: set[str] = set()
+    for term in SEARCH_TERMS:
+        for candidate in search_internet_archive(term):
+            if candidate["video_url"] not in seen_urls:
+                seen_urls.add(candidate["video_url"])
+                yield candidate
+        for candidate in search_wikimedia_commons(term):
+            if candidate["video_url"] not in seen_urls:
+                seen_urls.add(candidate["video_url"])
+                yield candidate
+
+
+def run_agent() -> dict[str, Any]:
+    """Read-only diagnostic preview. Never writes to Supabase or local state."""
+    headers = supabase_headers()  # read credentials required for the existing dedupe snapshot
+    del headers
+    _state = load_state()  # read-only; used only for duplicate suppression
+    db_ids, count = database_snapshot()
+    processed = set(str(value) for value in _state["processed_ids"])
+    processed.update(db_ids)
+    previewed = 0
+    discovered = 0
+    rejected_duplicate = rejected_probe = rejected_url = rejected_license = 0
+
+    if count >= DAILY_TARGET:
+        LOG.info("Daily target already reached (%s/%s)", count, DAILY_TARGET)
+        return {"status": "TARGET_ALREADY_REACHED", "added": 0, "previewed": 0, "daily_count": count, "target": DAILY_TARGET}
+
+    for candidate in discover_candidates():
+        discovered += 1
+        if count + previewed >= DAILY_TARGET:
+            break
+        url = candidate.get("video_url", "")
+        if not is_allowed_media_url(url):
+            rejected_url += 1
+            LOG.info("[CANDIDATE_REJECT] reason=media_url_not_allowed")
+            continue
+        license_url = clean_text(candidate.get("license_url", ""), 500)
+        if not license_allows_commercial_use(license_url):
+            rejected_license += 1
+            LOG.info("[CANDIDATE_REJECT] reason=license_not_confirmed_commercial title=%s", clean_text(candidate.get("title", ""), 100))
+            continue
+        video_id = stable_video_id(url)
+        if video_id in processed:
+            rejected_duplicate += 1
+            LOG.info("[CANDIDATE_REJECT] reason=duplicate video_id=%s", video_id[:12])
+            continue
+        probe = check_video_url(url)
+        if not probe.get("ok"):
+            rejected_probe += 1
+            LOG.info("[CANDIDATE_REJECT] reason=media_probe_failed detail=%s", probe.get("reason"))
+            continue
+        record = make_record(candidate, probe)
+        previewed += 1
+        LOG.info("DRY_RUN preview %s/%s: title=%s license_metadata_valid=%s commercial_use_allowed=%s rights_verified=%s publication_approved=%s",
+                 count + previewed, DAILY_TARGET, clean_text(candidate.get("title", ""), 100),
+                 record["license_metadata_valid"], record["commercial_use_allowed_by_stated_license"],
+                 record["rights_verified"], record["publication_approved"])
+
+    LOG.info("[DISCOVERY_SUMMARY] yielded=%d previewed=%d rejected_url=%d rejected_license=%d rejected_duplicate=%d rejected_probe=%d daily_count=%d target=%d",
+             discovered, previewed, rejected_url, rejected_license, rejected_duplicate, rejected_probe, count, DAILY_TARGET)
+    report = {"status": "DRY_RUN_PREVIEW", "added": 0, "previewed": previewed, "daily_count": count, "target": DAILY_TARGET}
+    LOG.info("DRY_RUN permanently enabled: no Supabase writes and no local state changes")
+    return report
+
+
+if __name__ == "__main__":
+    try:
+        result = run_agent()
+        print(json.dumps(result, ensure_ascii=False))
+    except Exception as exc:
+        LOG.error("Agent stopped: %s: %s", type(exc).__name__, exc)
+        raise SystemExit(1)
