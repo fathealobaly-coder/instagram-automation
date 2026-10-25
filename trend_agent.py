@@ -33,11 +33,13 @@ SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": USER_AGENT})
 
 # Restrict discovery to fictional animation/CGI adventure content; do not seek real-world stunts.
+# Keep source searches broad enough to return candidate records; the strict
+# license, direct-MP4, duplicate, and media-probe gates run after discovery.
 SEARCH_TERMS = (
-    "public domain animated adventure film",
-    "animated fantasy adventure scene",
-    "CGI fictional adventure sequence",
-    "public domain cartoon adventure",
+    "animated",
+    "animation adventure",
+    "fantasy cartoon",
+    "computer animation",
 )
 
 # Conservative allow-list: source APIs and their official media hosts only.
@@ -160,10 +162,28 @@ def check_video_url(url: str, session: requests.Session | None = None) -> dict[s
         return {"ok": False, "reason": f"request error: {type(exc).__name__}"}
 
 
+def build_archive_query(term: str) -> str:
+    """Build a broad AND-token search across title and description, not a long exact phrase."""
+    tokens = re.findall(r"[a-zA-Z0-9]+", term.lower())
+    if not tokens:
+        raise ValueError("Search term must contain at least one alphanumeric token")
+    joined = " AND ".join(tokens)
+    return f"mediatype:movies AND (title:({joined}) OR description:({joined}))"
+
+
+def build_commons_query(term: str) -> str:
+    """Build a non-quoted Commons search so terms are not forced into one exact phrase."""
+    tokens = re.findall(r"[a-zA-Z0-9]+", term.lower())
+    if not tokens:
+        raise ValueError("Search term must contain at least one alphanumeric token")
+    return "filetype:video " + " ".join(tokens)
+
+
 def search_internet_archive(term: str, rows: int = 20, session: requests.Session | None = None) -> list[dict[str, Any]]:
     """Search Internet Archive and return only MP4s with explicit open-license metadata."""
     client = session or SESSION
-    query = f'mediatype:movies AND (title:"{term}" OR description:"{term}")'
+    query = build_archive_query(term)
+    LOG.info("[IA_QUERY] term=%r query=%s", term, query)
     try:
         response = client.get(
             "https://archive.org/advancedsearch.php",
@@ -247,11 +267,12 @@ def search_wikimedia_commons(term: str, limit: int = 30, session: requests.Sessi
     client = session or SESSION
     params = {
         "action": "query", "format": "json", "generator": "search",
-        "gsrsearch": f'filetype:video "{term}"', "gsrnamespace": 6,
+        "gsrsearch": build_commons_query(term), "gsrnamespace": 6,
         "gsrlimit": min(max(limit, 1), 50), "prop": "imageinfo",
         "iiprop": "url|mime|size|extmetadata",
     }
     try:
+        LOG.info("[COMMONS_QUERY] term=%r query=%s", term, params["gsrsearch"])
         response = client.get("https://commons.wikimedia.org/w/api.php", params=params, timeout=REQUEST_TIMEOUT)
         check_source_response(response, "Wikimedia Commons search")
         pages = response.json().get("query", {}).get("pages", {})
