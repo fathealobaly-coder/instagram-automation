@@ -49,7 +49,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          DRY_RUN: 'true'
+          DRY_RUN: ${{ secrets.DRY_RUN }}  # 👈 تم التطهير: الربط ديناميكي تماماً الآن بالرقم 0
         run: python trend_agent.py
 
       - name: Run Instagram Agent
@@ -58,5 +58,5 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           INSTAGRAM_ACCOUNT_ID: ${{ secrets.INSTAGRAM_ACCOUNT_ID }}
           INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
-          DRY_RUN: 'true'
+          DRY_RUN: ${{ secrets.DRY_RUN }}  # 👈 تم التطهير: تحرير محرك النشر والأرباح بالكامل حياً
         run: python instagram_agent.py
