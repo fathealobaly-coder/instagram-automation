@@ -60,3 +60,4 @@ jobs:
           INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
           DRY_RUN: ${{ secrets.DRY_RUN }}  # 👈 تم التطهير: تحرير محرك النشر والأرباح بالكامل حياً
         run: python instagram_agent.py
+
