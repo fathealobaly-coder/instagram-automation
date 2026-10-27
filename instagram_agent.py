@@ -1,104 +1,168 @@
 import os
 import sys
-import json
-import logging
 import time
+import logging
+from datetime import datetime, timezone
+from typing import Any
+
 import requests
-from supabase import create_client, Client
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [AUDIT_MONITOR] %(levelname)s: %(message)s",
+    format="%(asctime)s [OMNI_AUDIT_ACTIVE] %(levelname)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
-    force=True
+    force=True,
 )
+logger = logging.getLogger("omni_monolith")
 
 TABLE_NAME = "generated_videos"
+DEFAULT_CAPTION = (
+    "Epic Cinematic Action Edit! 🔥🎬\n"
+    "اخوك الي ما ينلعب وياه :\n"
+    "#explore #fyp #action #cinema"
+)
+GRAPH_BASE = "https://graph.facebook.com"
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def require_video_url(value: str) -> str:
+    value = value.strip()
+    if not value.startswith(("https://", "http://")):
+        raise ValueError("VIDEO_URL must be an HTTP(S) URL to a directly accessible video file.")
+    if "wikimedia.org" == value.split("/")[2].lower() or value.rstrip("/").lower() in {
+        "https://wikimedia.org", "http://wikimedia.org"
+    }:
+        raise ValueError("VIDEO_URL is a website homepage, not a direct video URL.")
+    return value
+
+
+def graph_post(session: Any, url: str, data: dict, timeout: int = 30) -> dict:
+    response = session.post(url, data=data, timeout=timeout)
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Meta returned non-JSON response (HTTP {response.status_code}).") from exc
+    if not response.ok or "error" in body:
+        raise RuntimeError(f"Meta API request failed (HTTP {response.status_code}): {body.get('error', body)}")
+    return body
+
+
+def wait_for_container(session: Any, graph_version: str, creation_id: str,
+                       access_token: str, timeout_seconds: int = 600) -> None:
+    status_url = f"{GRAPH_BASE}/{graph_version}/{creation_id}"
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        response = session.get(
+            status_url,
+            params={"fields": "status_code,status", "access_token": access_token},
+            timeout=30,
+        )
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Meta returned non-JSON container status.") from exc
+        if not response.ok or "error" in body:
+            raise RuntimeError(f"Could not check Meta container status: {body.get('error', body)}")
+        status = str(body.get("status_code", "")).upper()
+        if status == "FINISHED":
+            return
+        if status in {"ERROR", "EXPIRED"}:
+            raise RuntimeError(f"Meta media container ended with status {status}: {body}")
+        time.sleep(5)
+    raise TimeoutError(f"Meta media container {creation_id} was not ready within {timeout_seconds}s.")
+
 
 def main() -> int:
-    logging.info("LAUNCHING CRITICAL INSTAGRAM GRAPH API REELS PUBLISHING ENGINE...")
-    
-    # 1. سحب أوراق الاعتماد الحقيقية المشفرة في السيرفر
+    logger.info("Launching Instagram Reels queue/publisher.")
     supabase_url = os.getenv("SUPABASE_URL", "").strip()
     supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
     instagram_id = os.getenv("INSTAGRAM_ACCOUNT_ID", "").strip()
     access_token = os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip()
-    
-    if not all([supabase_url, supabase_key, instagram_id, access_token]):
-        logging.error("Fatal startup error: Instagram API or Supabase credentials missing from Repository Secrets.")
+    graph_version = os.getenv("META_GRAPH_API_VERSION", "v23.0").strip()
+    video_url_raw = os.getenv("VIDEO_URL", "").strip()
+    caption = os.getenv("INSTAGRAM_CAPTION", DEFAULT_CAPTION)
+
+    if not supabase_url or not supabase_key:
+        logger.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY.")
+        return 2
+    if not video_url_raw:
+        logger.error("Missing VIDEO_URL. Provide a direct, publicly reachable video URL that you have rights to publish.")
+        return 2
+    try:
+        video_url = require_video_url(video_url_raw)
+    except ValueError as exc:
+        logger.error("Invalid VIDEO_URL: %s", exc)
         return 2
 
     try:
-        # 2. الاتصال بـ Supabase لسحب آخر مقطع أكشن جاهز للنشر ولم ينشر بعد
-        supabase: Client = create_client(supabase_url, supabase_key)
-        response = supabase.table(TABLE_NAME).select("*").eq("status", "ready_to_publish").limit(1).execute()
-        rows = getattr(response, "data", [])
-        
-        if not rows:
-            logging.info("No 'ready_to_publish' video records found in database. Exiting smoothly.")
-            return 0
-            
-        video_record = rows[0]
-        row_id = video_record["id"]
-        video_url = video_record["video_url"]
-        caption = video_record["caption"]
-        
-        logging.info(f"Targeting Video Record ID {row_id} for live platform publishing. URL: {video_url}")
+        from supabase import create_client
+        supabase = create_client(supabase_url, supabase_key)
 
-        # 3. خطوة ميتا الرسمية 1: إنشاء حاوية ميديا للـ Reel (Create Container)
-        container_url = f"https://facebook.com{instagram_id}/media"
-        container_payload = {
-            "media_type": "REELS",
+        # Match the actual generated_videos schema: no video_hash/caption_text columns.
+        payload = {
             "video_url": video_url,
             "caption": caption,
-            "access_token": access_token
+            "status": "ready_to_publish",
         }
-        
-        logging.info("Step 1: Submitting Reels media container creation request to Meta Graph API...")
-        container_res = requests.post(container_url, data=container_payload, timeout=30)
-        container_data = container_res.json()
-        
-        if "id" not in container_data:
-            logging.error(f"Meta Graph Container Creation Failed: {json.dumps(container_data)}")
-            supabase.table(TABLE_NAME).update({"error_message": f"Container Failed: {container_data}"}).eq("id", row_id).execute()
+        logger.info("Queueing video in Supabase.")
+        db_response = supabase.table(TABLE_NAME).insert(payload).execute()
+        rows = getattr(db_response, "data", None)
+        if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict) or not rows[0].get("id"):
+            logger.error("Supabase insert returned no row ID; refusing to claim publication.")
             return 1
-            
-        creation_id = container_data["id"]
-        logging.info(f"Reels Container successfully generated. Creation ID: {creation_id}")
-        
-        # الانتظار الإجباري ثوانٍ لتجهيز ومعالجة الفيديو في سيرفرات ميتا قبل النشر
-        logging.info("Waiting for Meta servers to index and process video assets...")
-        time.sleep(15)
+        row_id = rows[0]["id"]
+        logger.info("Queued row ID: %s", row_id)
 
-        # 4. خطوة ميتا الرسمية 2: إطلاق ونشر الـ Reel علناً للملايين (Publish Container)
-        publish_url = f"https://facebook.com{instagram_id}/media_publish"
-        publish_payload = {
-            "creation_id": creation_id,
-            "access_token": access_token
-        }
-        
-        logging.info("Step 2: Commencing public structural dissemination on Instagram Reels...")
-        publish_res = requests.post(publish_url, data=publish_payload, timeout=30)
-        publish_data = publish_res.json()
-        
-        if "id" not in publish_data:
-            logging.error(f"Meta Graph Live Publishing Failed: {json.dumps(publish_data)}")
-            supabase.table(TABLE_NAME).update({"error_message": f"Publish Failed: {publish_data}"}).eq("id", row_id).execute()
+        # Queue-only mode is safe: never mark a row published unless Meta confirms it.
+        if not instagram_id or not access_token:
+            logger.warning("Instagram credentials absent; row remains ready_to_publish.")
+            return 0
+
+        try:
+            container_url = f"{GRAPH_BASE}/{graph_version}/{instagram_id}/media"
+            container = graph_post(
+                requests,
+                container_url,
+                {"media_type": "REELS", "video_url": video_url,
+                 "caption": caption, "access_token": access_token},
+            )
+            creation_id = container.get("id")
+            if not creation_id:
+                raise RuntimeError(f"Meta did not return a media container ID: {container}")
+
+            wait_for_container(requests, graph_version, creation_id, access_token)
+            publish_url = f"{GRAPH_BASE}/{graph_version}/{instagram_id}/media_publish"
+            published = graph_post(
+                requests, publish_url,
+                {"creation_id": creation_id, "access_token": access_token},
+            )
+            if not published.get("id"):
+                raise RuntimeError(f"Meta did not return a published media ID: {published}")
+
+            supabase.table(TABLE_NAME).update({
+                "status": "published",
+                "published_at": utc_now(),
+                "error_message": None,
+            }).eq("id", row_id).execute()
+            logger.info("Meta confirmed publication. Media ID: %s", published["id"])
+            return 0
+
+        except Exception as publish_error:
+            message = str(publish_error)[:2000]
+            logger.exception("Instagram publishing failed.")
+            supabase.table(TABLE_NAME).update({
+                "status": "failed_publishing",
+                "error_message": message,
+            }).eq("id", row_id).execute()
             return 1
 
-        # 5. تحديث قاعدة البيانات بنجاح النشر الفعلي وإغلاق الدورة
-        logging.info(f"INSTAGRAM REELS PUBLISHED SUCCESSFULLY! Live Media ID: {publish_data['id']}")
-        supabase.table(TABLE_NAME).update({
-            "status": "published",
-            "published_at": datetime.now(timezone.utc).isoformat()
-        }).eq("id", row_id).execute()
-        
-        logging.info("Supabase repository tracking state updated to 'published'. Exit Code 0.")
-        return 0
-
-    except Exception as e:
-        logging.error(f"FATAL: Instagram Agent execution crash encountered: {e}")
+    except Exception as exc:
+        logger.exception("Agent failed: %s", exc)
         return 1
+
 
 if __name__ == "__main__":
     sys.exit(main())
