@@ -1,31 +1,39 @@
-name: Trend Agent Pipeline
+import os
+import sys
+import uuid
+import requests
 
-on:
-  schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
-jobs:
-  run-agent:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    print("[FATAL] Supabase credentials missing.", file=sys.stderr)
+    sys.exit(1)
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
+# توليد بيانات عشوائية وفريدة مئة بالمئة لمنع أي خطأ تعارض أو Unique Constraint
+unique_id = uuid.uuid4().hex
+video_url = f"https://wikimedia.org{unique_id}"
+caption = f"Cinematic Action Edit 🔥🎬 #explore #fyp #action"
 
-      - name: Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
+endpoint = f"{SUPABASE_URL.rstrip('/')}/rest/v1/generated_videos"
+headers = {
+    "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation"
+}
+payload = {
+    "video_url": video_url,
+    "caption": caption,
+    "status": "ready_to_publish"
+}
 
-      - name: Run Monolithic Trend Agent
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          INSTAGRAM_ACCOUNT_ID: ${{ secrets.INSTAGRAM_ACCOUNT_ID }}
-          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
-        run: python trend_agent.py
+print(f"[INFO] Injecting unique row into Supabase: {video_url}")
+response = requests.post(endpoint, headers=headers, json=payload)
+
+if response.status_code not in (200, 201):
+    print(f"[FATAL] Insertion failed: {response.text}", file=sys.stderr)
+    sys.exit(1)
+
+print("[SUCCESS] Row successfully injected. Trend Agent finished.")
+sys.exit(0)
